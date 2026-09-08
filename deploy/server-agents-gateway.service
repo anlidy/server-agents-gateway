@@ -1,0 +1,22 @@
+[Unit]
+Description=Server Agents Gateway Service
+Documentation=https://github.com/anlidy/server-agents-gateway
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/server-agents-gateway
+ExecStart=/usr/bin/python3 /opt/server-agents-gateway/server.py
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+# Security hardening options
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

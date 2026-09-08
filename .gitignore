@@ -1,0 +1,12 @@
+# Git ignore rules for server-agents-gateway
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+data/
+*.db
+*.db-journal
+*.log
+.vscode/
+.idea/
