@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from config import config
+from audit_redact import redact_secrets, redact_structure
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -117,6 +118,12 @@ def append_audit_log(
 ) -> str:
     log_id = str(uuid.uuid4())
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    # Redact secrets before persistence so operators querying audits cannot read tokens
+    safe_target = redact_secrets(target)
+    safe_reason = redact_secrets(intent_reason)
+    safe_params = redact_structure(params or {})
+    safe_diff = redact_secrets(diff_snapshot) if diff_snapshot else None
+    safe_output = redact_secrets(output_summary) if output_summary else None
     with get_db_connection() as conn:
         conn.execute(
             """
@@ -131,15 +138,15 @@ def append_audit_log(
                 now_iso,
                 agent_id,
                 action_type,
-                target,
-                intent_reason,
+                safe_target,
+                safe_reason,
                 lease_token,
                 1 if is_temporary else 0,
-                json.dumps(params or {}, ensure_ascii=False),
+                json.dumps(safe_params, ensure_ascii=False),
                 status,
                 duration_ms,
-                diff_snapshot,
-                output_summary,
+                safe_diff,
+                safe_output,
             ),
         )
         conn.commit()
