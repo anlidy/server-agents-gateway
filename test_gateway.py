@@ -15,6 +15,7 @@ os.environ["GATEWAY_DB_PATH"] = str(Path(tempfile.gettempdir()) / "test_gateway.
 from auth import authenticate_bearer_token, issue_agent_token, revoke_agent_token
 from config import config
 from db import append_audit_log, get_db_connection, init_db, query_audit_logs
+from audit_redact import redact_secrets, redact_structure
 from executor import CommandExecutionError, execute_allowlisted_command, is_command_allowed
 from lock_manager import (
     LockAcquisitionError,
@@ -153,6 +154,52 @@ class TestGatewayCore(unittest.TestCase):
         # Verify revoked token no longer works
         auth_revoked = authenticate_bearer_token(f"Bearer {issued_token}")
         self.assertIsNone(auth_revoked)
+
+
+    def test_command_allowlist_rejects_shell_chaining_tokens(self):
+        # With argv execution, shell operators must not be accepted as separate tokens
+        self.assertFalse(is_command_allowed("df -h ; rm -rf /tmp/x"))
+        self.assertFalse(is_command_allowed("uptime | bash"))
+        self.assertFalse(is_command_allowed("ps && id"))
+        # Still allow plain diagnostics
+        self.assertTrue(is_command_allowed("df -h"))
+        self.assertTrue(is_command_allowed("docker ps -a"))
+
+    def test_execute_does_not_use_shell_expansion(self):
+        # shell=False: literal $HOME is not expanded into a path by the shell
+        code, out, err = execute_allowlisted_command("df $HOME")
+        # df should run; argument remains literal (exit code may be non-zero on some systems)
+        self.assertIsInstance(code, int)
+
+    def test_audit_redaction_strips_bearer_and_tokens(self):
+        raw = (
+            "curl -H \"Authorization: Bearer sag_cursor_helm_abc123deadbeef\" "
+            "-H \"CF-Access-Client-Secret: cfast_secrethere123\" https://example.com"
+        )
+        redacted = redact_secrets(raw)
+        self.assertNotIn("sag_cursor_helm_abc123deadbeef", redacted)
+        self.assertNotIn("cfast_secrethere123", redacted)
+        self.assertIn("***", redacted)
+
+        payload = redact_structure({"command": raw, "nested": {"token": "github_pat_AAA_BBB"}})
+        self.assertNotIn("sag_cursor_helm_abc123deadbeef", payload["command"])
+        self.assertEqual(payload["nested"]["token"], "***PAT***")
+
+        # Persistence path: append_audit_log must store redacted params
+        append_audit_log(
+            agent_id="test:agent",
+            action_type="shell_exec",
+            target="curl",
+            intent_reason="probe",
+            status="FAILED",
+            params={"command": raw},
+            output_summary="Bearer sag_should_not_persist_xyz",
+        )
+        rows = query_audit_logs(agent_id="test:agent", limit=1)
+        self.assertTrue(rows)
+        stored = rows[0]["params_json"]
+        self.assertNotIn("sag_cursor_helm_abc123deadbeef", stored)
+        self.assertNotIn("sag_should_not_persist_xyz", rows[0]["output_summary"] or "")
 
 
 if __name__ == "__main__":

@@ -1,12 +1,12 @@
 """
-Execution engine with strict allowlist and unconditional post-exec reconcile.
+Execution engine with strict allowlist and argv-only execution (no shell).
 """
 
 import shlex
 import subprocess
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
-# Pre-defined allowlisted command prefixes
+# Pre-defined allowlisted command prefixes (matched on argv, not raw shell strings)
 ALLOWLIST_PREFIXES: List[str] = [
     # System resources & inspection
     "df",
@@ -36,11 +36,11 @@ ALLOWLIST_PREFIXES: List[str] = [
     "git log",
     "git diff",
     "git branch",
-    # Managed scripts directory
+    # Managed scripts directory (path prefix)
     "/opt/server-agents-gateway/scripts/",
 ]
 
-# Explicit forbidden tokens (meta-interpreters that can evaluate arbitrary strings)
+# Explicit forbidden tokens (meta-interpreters / shell control operators)
 DISALLOWED_SUBSTRINGS: List[str] = [
     "bash -c",
     "sh -c",
@@ -58,28 +58,95 @@ DISALLOWED_SUBSTRINGS: List[str] = [
     "mkfs",
 ]
 
+BANNED_EXECUTABLES = {
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "fish",
+    "python",
+    "python2",
+    "python3",
+    "node",
+    "nodejs",
+    "perl",
+    "ruby",
+    "php",
+}
+
+# Tokens that only make sense for shell chaining / redirection
+SHELL_OPERATOR_TOKENS = {
+    ";",
+    "|",
+    "||",
+    "&",
+    "&&",
+    "`",
+    ">",
+    ">>",
+    "<",
+    "<<",
+}
+
 
 class CommandExecutionError(Exception):
     pass
 
 
+def _split_argv(command: str) -> List[str]:
+    try:
+        argv = shlex.split(command.strip())
+    except ValueError as exc:
+        raise CommandExecutionError(f"403 Forbidden: Malformed command: {exc}") from exc
+    if not argv:
+        raise CommandExecutionError("403 Forbidden: Empty command")
+    return argv
+
+
 def is_command_allowed(command: str) -> bool:
     cmd_clean = command.strip()
-    # Check disallowed substring / meta-interpreters first
+    if not cmd_clean:
+        return False
+
     for bad in DISALLOWED_SUBSTRINGS:
         if bad in cmd_clean:
             return False
 
-    # Check against allowlist prefixes
+    try:
+        argv = shlex.split(cmd_clean)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+
+    exe = argv[0].rsplit("/", 1)[-1]
+    if exe in BANNED_EXECUTABLES:
+        return False
+
+    for tok in argv:
+        if tok in SHELL_OPERATOR_TOKENS or tok.startswith("$("):
+            return False
+
     for prefix in ALLOWLIST_PREFIXES:
-        if cmd_clean == prefix or cmd_clean.startswith(prefix + " "):
+        # Directory allowlist: any executable under the managed scripts path
+        if prefix.endswith("/"):
+            if argv[0].startswith(prefix):
+                return True
+            continue
+        try:
+            prefix_argv = shlex.split(prefix)
+        except ValueError:
+            continue
+        if not prefix_argv:
+            continue
+        if len(argv) >= len(prefix_argv) and argv[: len(prefix_argv)] == prefix_argv:
             return True
     return False
 
 
 def execute_allowlisted_command(command: str, timeout_seconds: int = 30) -> Tuple[int, str, str]:
     """
-    Executes a command safely under strict allowlist policy.
+    Executes a command safely under strict allowlist policy using argv (shell=False).
     Returns (exit_code, stdout, stderr).
     Raises CommandExecutionError if command violates policy.
     """
@@ -89,10 +156,11 @@ def execute_allowlisted_command(command: str, timeout_seconds: int = 30) -> Tupl
             f"Only pre-approved diagnostics and audited scripts are allowed."
         )
 
+    argv = _split_argv(command)
     try:
         proc = subprocess.run(
-            command,
-            shell=True,
+            argv,
+            shell=False,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
