@@ -16,6 +16,14 @@ from .db import get_db_connection
 STATUS_START = "<!-- sag-status:start -->"
 STATUS_END = "<!-- sag-status:end -->"
 
+CONVENTIONS_TEMPLATE = """\
+- 不要改文首 `sag-status` 围栏。
+- Inventory 一节一个 `### 短名`。要探活就写一行：
+  `- probe: systemd <unit>` / `docker <container>` / `http <url>` / `tcp <host:port>`
+- 可选：`- path:` `- url:` `- listen:` `- depends:`。说明写在列表下面。不要写当前 up/down。
+- 拓扑变化同一轮改对应 `###`。
+"""
+
 _PROBE_LINE = re.compile(r"^- probe: (.+)$")
 _PROBE_VAL = re.compile(r"^(systemd|docker|http|tcp)\s+(.+)$")
 _HEADING = re.compile(r"^###\s+(\S+)\s*$")
@@ -124,7 +132,8 @@ def _skeleton(hostname: str) -> str:
         f"{STATUS_END}\n\n"
         f"## Host\n\n\n"
         f"## Inventory\n\n\n"
-        f"## Conventions\n"
+        f"## Conventions\n\n"
+        f"{CONVENTIONS_TEMPLATE}"
     )
 
 

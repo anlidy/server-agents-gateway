@@ -6,7 +6,8 @@ MCP_TOOLS_SPEC = [
         "description": (
             "Run a command with bash -lc (pipes and redirects work). "
             "rm is bound to an absolute-path recycle-bin wrapper; /bin/rm still deletes for real. "
-            "If you add, remove, or move a service, update SERVER_AGENTS.md Inventory in the same turn."
+            "If you add, remove, or move a service, update the matching ### in SERVER_AGENTS.md "
+            "Inventory (see ## Conventions for `- probe:` format) in the same turn."
         ),
         "inputSchema": {
             "type": "object",
@@ -57,7 +58,9 @@ MCP_TOOLS_SPEC = [
         "name": "hub_write_file",
         "description": (
             "Write a text file. Existing content is moved to the recycle bin first. "
-            "If you change topology (new service, URL, path), update SERVER_AGENTS.md Inventory."
+            "If you change topology (new service, URL, path), add or edit a ### section "
+            "under ## Inventory, including a `- probe:` line if it should be health-checked. "
+            "Format is in ## Conventions of SERVER_AGENTS.md."
         ),
         "inputSchema": {
             "type": "object",
@@ -129,9 +132,10 @@ MCP_TOOLS_SPEC = [
     {
         "name": "hub_get_overview",
         "description": (
-            "Read SERVER_AGENTS.md from disk (no cache). "
-            "Status fence is auto-refreshed; Inventory/Host/Conventions are handwritten. "
-            "Start work by reading this."
+            "Read SERVER_AGENTS.md from disk (no cache). Start work by reading this. "
+            "Top sag-status fence is generated (do not edit). "
+            "Inventory ### sections: add `- probe: systemd|docker|http|tcp ...` to show up/down. "
+            "Full format is in ## Conventions in the same file."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
