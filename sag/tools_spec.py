@@ -33,6 +33,27 @@ MCP_TOOLS_SPEC = [
         },
     },
     {
+        "name": "hub_list_dir",
+        "description": "List a directory (non-recursive). Returns name, is_dir, size, mtime. Caps at 2000 entries.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "hub_mkdir",
+        "description": "Create a directory, including parents (mkdir -p). No-op if it already exists.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["path", "reason"],
+        },
+    },
+    {
         "name": "hub_write_file",
         "description": (
             "Write a text file. Existing content is moved to the recycle bin first. "
@@ -46,6 +67,25 @@ MCP_TOOLS_SPEC = [
                 "reason": {"type": "string"},
             },
             "required": ["path", "content", "reason"],
+        },
+    },
+    {
+        "name": "hub_patch_file",
+        "description": (
+            "Replace old_string with new_string in a text file. "
+            "Fails if old_string is missing or matches more than once (unless replace_all). "
+            "Previous content goes to the recycle bin."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "reason": {"type": "string"},
+                "replace_all": {"type": "boolean", "default": False},
+            },
+            "required": ["path", "old_string", "new_string", "reason"],
         },
     },
     {

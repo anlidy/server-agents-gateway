@@ -24,7 +24,10 @@ from .tools import (
     tool_get_overview,
     tool_get_status,
     tool_issue_agent_token,
+    tool_list_dir,
     tool_list_trash,
+    tool_mkdir,
+    tool_patch_file,
     tool_query_audit_logs,
     tool_read_file,
     tool_rebuild_overview,
@@ -60,8 +63,14 @@ def dispatch_tool(agent_id: str, role: str, tool_name: str, arguments: Dict[str,
         return tool_shell(agent_id, **cleaned_args)
     elif tool_name == "hub_read_file":
         return tool_read_file(agent_id, **cleaned_args)
+    elif tool_name == "hub_list_dir":
+        return tool_list_dir(agent_id, **cleaned_args)
+    elif tool_name == "hub_mkdir":
+        return tool_mkdir(agent_id, **cleaned_args)
     elif tool_name == "hub_write_file":
         return tool_write_file(agent_id, **cleaned_args)
+    elif tool_name == "hub_patch_file":
+        return tool_patch_file(agent_id, **cleaned_args)
     elif tool_name == "hub_delete_file":
         return tool_delete_file(agent_id, **cleaned_args)
     elif tool_name == "hub_list_trash":

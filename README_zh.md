@@ -26,7 +26,8 @@
 | 工具 | 作用 |
 | :--- | :--- |
 | `hub_shell` | `bash -lc`。`rm` 进回收站；`/bin/rm` 仍是真删。 |
-| `hub_read_file` / `hub_write_file` / `hub_delete_file` | 文本文件。覆盖/删除先进回收站。 |
+| `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | 文本文件。覆盖/局部替换/删除先进回收站。 |
+| `hub_list_dir` / `hub_mkdir` | 列目录；mkdir -p。 |
 | `hub_list_trash` / `hub_restore_file` | 按 id 还原，30 天过期。 |
 | `hub_get_overview` / `hub_rebuild_overview` | 读文档；rebuild 只刷新状态围栏。 |
 | `hub_get_status` | 负载、内存、磁盘、失败单元、探活。 |

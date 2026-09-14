@@ -51,7 +51,10 @@ from sag.tools import (
     tool_get_overview,
     tool_get_status,
     tool_issue_agent_token,
+    tool_list_dir,
     tool_list_trash,
+    tool_mkdir,
+    tool_patch_file,
     tool_query_audit_logs,
     tool_read_file,
     tool_rebuild_overview,
@@ -299,6 +302,55 @@ class TestGatewayV2(unittest.TestCase):
         res = tool_read_file("test:agent", str(path), offset=2, limit=1)
         self.assertEqual(res["content"].strip(), "line2")
 
+    def test_mkdir_and_list_dir(self):
+        root = Path(config.shell_cwd) / "newtree"
+        nested = root / "a" / "b"
+        out = tool_mkdir("test:agent", str(nested), "make dirs")
+        self.assertTrue(nested.is_dir())
+        self.assertEqual(Path(out["path"]), nested.resolve())
+        (nested / "f.txt").write_text("x", encoding="utf-8")
+        listing = tool_list_dir("test:agent", str(nested))
+        names = {e["name"] for e in listing["entries"]}
+        self.assertEqual(names, {"f.txt"})
+        self.assertFalse(listing["entries"][0]["is_dir"])
+        parent = tool_list_dir("test:agent", str(root / "a"))
+        self.assertEqual(parent["entries"][0]["name"], "b")
+        self.assertTrue(parent["entries"][0]["is_dir"])
+        again = tool_mkdir("test:agent", str(nested), "idempotent")
+        self.assertTrue(again.get("existed"))
+
+    def test_mkdir_rejects_file_path(self):
+        f = Path(config.shell_cwd) / "notdir.txt"
+        f.write_text("x", encoding="utf-8")
+        with self.assertRaises(Exception):
+            tool_mkdir("test:agent", str(f), "should fail")
+
+    def test_list_dir_rejects_file(self):
+        f = Path(config.shell_cwd) / "afile.txt"
+        f.write_text("x", encoding="utf-8")
+        with self.assertRaises(Exception):
+            tool_list_dir("test:agent", str(f))
+
+    def test_patch_file_unique_and_replace_all(self):
+        path = Path(config.shell_cwd) / "cfg.txt"
+        path.write_text("aaa\nbbb\naaa\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            tool_patch_file("test:agent", str(path), "aaa", "ccc", "not unique")
+        self.assertEqual(path.read_text(encoding="utf-8"), "aaa\nbbb\naaa\n")
+        out = tool_patch_file("test:agent", str(path), "bbb", "ddd", "unique")
+        self.assertEqual(out["replacements"], 1)
+        self.assertEqual(path.read_text(encoding="utf-8"), "aaa\nddd\naaa\n")
+        out = tool_patch_file(
+            "test:agent", str(path), "aaa", "eee", "all", replace_all=True
+        )
+        self.assertEqual(out["replacements"], 2)
+        self.assertEqual(path.read_text(encoding="utf-8"), "eee\nddd\neee\n")
+        self.assertTrue(list_trash())
+        with self.assertRaises(ValueError):
+            tool_patch_file("test:agent", str(path), "zzz", "nope", "missing")
+        with self.assertRaises(ValueError):
+            tool_patch_file("test:agent", str(path), "", "x", "empty")
+
     def test_overview_status_refresh_preserves_inventory(self):
         marker = "UNIQUE_INVENTORY_SENTENCE_caddy_reload"
         ensure_document()
@@ -376,6 +428,9 @@ who changes topology updates inventory
         names = {t["name"] for t in MCP_TOOLS_SPEC}
         self.assertIn("hub_shell", names)
         self.assertIn("hub_read_file", names)
+        self.assertIn("hub_list_dir", names)
+        self.assertIn("hub_mkdir", names)
+        self.assertIn("hub_patch_file", names)
         self.assertIn("hub_restore_file", names)
         self.assertNotIn("hub_execute_command", names)
         self.assertNotIn("hub_acquire_lock", names)

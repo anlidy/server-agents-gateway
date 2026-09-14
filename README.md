@@ -26,7 +26,8 @@ Safety is audit + trash, not a command allowlist.
 | Tool | Role |
 | :--- | :--- |
 | `hub_shell` | `bash -lc`. `rm` is wrapped into trash; `/bin/rm` is a real delete. |
-| `hub_read_file` / `hub_write_file` / `hub_delete_file` | Text files. Overwrite/delete → recycle bin. |
+| `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | Text files. Overwrite/patch/delete → recycle bin. |
+| `hub_list_dir` / `hub_mkdir` | List a directory; mkdir -p. |
 | `hub_list_trash` / `hub_restore_file` | Restore by id. 30-day expiry. |
 | `hub_get_overview` / `hub_rebuild_overview` | Read `SERVER_AGENTS.md`; rebuild only refreshes the status fence. |
 | `hub_get_status` | Load, memory, disks, failed units, probes. |

@@ -5,9 +5,12 @@ v2 MCP tool implementations.
 from __future__ import annotations
 
 import difflib
+import stat
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+_LIST_DIR_MAX = 2000
 
 from .auth import issue_agent_token, revoke_agent_token
 from .config import config
@@ -154,6 +157,174 @@ def tool_read_file(
         params={"offset": offset, "limit": limit},
     )
     return {"path": str(target), "content": content}
+
+
+def tool_list_dir(agent_id: str, path: str) -> Dict[str, Any]:
+    target = Path(path).resolve()
+    if not target.exists():
+        append_audit(
+            agent_id=agent_id,
+            tool_name="hub_list_dir",
+            action_type="dir_list",
+            target=str(target),
+            reason="",
+            status="FAILED",
+        )
+        raise FileNotFoundError(str(target))
+    if not target.is_dir():
+        exc = NotADirectoryError(str(target))
+        _audit_then_raise(agent_id, "hub_list_dir", "dir_list", target, "", "FAILED", exc)
+    entries: List[Dict[str, Any]] = []
+    truncated = False
+    try:
+        names = sorted(p.name for p in target.iterdir())
+    except OSError as exc:
+        _audit_then_raise(agent_id, "hub_list_dir", "dir_list", target, "", "FAILED", exc)
+    if len(names) > _LIST_DIR_MAX:
+        names = names[:_LIST_DIR_MAX]
+        truncated = True
+    for name in names:
+        child = target / name
+        try:
+            st = child.lstat()
+        except OSError:
+            continue
+        entries.append(
+            {
+                "name": name,
+                "is_dir": stat.S_ISDIR(st.st_mode),
+                "is_symlink": stat.S_ISLNK(st.st_mode),
+                "size": st.st_size,
+                "mtime": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime)),
+            }
+        )
+    append_audit(
+        agent_id=agent_id,
+        tool_name="hub_list_dir",
+        action_type="dir_list",
+        target=str(target),
+        reason="",
+        status="SUCCESS",
+        params={"count": len(entries), "truncated": truncated},
+    )
+    return {"path": str(target), "entries": entries, "truncated": truncated}
+
+
+def tool_mkdir(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
+    target = Path(path).resolve()
+    if is_protected(target):
+        _audit_then_raise(
+            agent_id,
+            "hub_mkdir",
+            "dir_create",
+            target,
+            reason,
+            "REJECTED",
+            ProtectedPathError(f"Refusing to modify protected path: {target}"),
+        )
+    if target.exists() and not target.is_dir():
+        exc = NotADirectoryError(f"exists and is not a directory: {target}")
+        _audit_then_raise(agent_id, "hub_mkdir", "dir_create", target, reason, "FAILED", exc)
+    existed = target.is_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    append_audit(
+        agent_id=agent_id,
+        tool_name="hub_mkdir",
+        action_type="dir_create",
+        target=str(target),
+        reason=reason,
+        status="SUCCESS",
+        params={"existed": existed},
+    )
+    return {"path": str(target), "existed": existed}
+
+
+def tool_patch_file(
+    agent_id: str,
+    path: str,
+    old_string: str,
+    new_string: str,
+    reason: str,
+    replace_all: bool = False,
+) -> Dict[str, Any]:
+    target = Path(path).resolve()
+    if is_protected(target):
+        _audit_then_raise(
+            agent_id,
+            "hub_patch_file",
+            "file_patch",
+            target,
+            reason,
+            "REJECTED",
+            ProtectedPathError(f"Refusing to modify protected path: {target}"),
+        )
+    if not old_string:
+        exc = ValueError("old_string must not be empty")
+        _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
+    if not target.exists():
+        append_audit(
+            agent_id=agent_id,
+            tool_name="hub_patch_file",
+            action_type="file_patch",
+            target=str(target),
+            reason=reason,
+            status="FAILED",
+        )
+        raise FileNotFoundError(str(target))
+    if target.is_dir():
+        exc = IsADirectoryError(str(target))
+        _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
+    raw = target.read_bytes()
+    if b"\x00" in raw[:8192]:
+        exc = ValueError("binary file")
+        _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
+    try:
+        old = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
+    n = old.count(old_string)
+    if n == 0:
+        exc = ValueError("old_string not found")
+        _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
+    if n > 1 and not replace_all:
+        exc = ValueError(f"old_string matched {n} times; pass replace_all=true or make it unique")
+        _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
+    new = old.replace(old_string, new_string) if replace_all else old.replace(old_string, new_string, 1)
+    replacements = n if replace_all else 1
+    trash_id = trash_put(target, source="patch_file", agent_id=agent_id)
+    if target.resolve() == overview_path().resolve():
+        write_handwritten(new)
+    else:
+        target.write_text(new, encoding="utf-8")
+    try:
+        reconcile()
+    except Exception:
+        pass
+    diff_lines = list(
+        difflib.unified_diff(
+            old.splitlines(),
+            new.splitlines(),
+            fromfile=f"a/{target.name}",
+            tofile=f"b/{target.name}",
+            lineterm="",
+        )
+    )
+    append_audit(
+        agent_id=agent_id,
+        tool_name="hub_patch_file",
+        action_type="file_patch",
+        target=str(target),
+        reason=reason,
+        status="SUCCESS",
+        trash_id=trash_id,
+        diff="\n".join(diff_lines),
+        params={"replacements": replacements, "replace_all": bool(replace_all)},
+    )
+    return {
+        "path": str(target),
+        "replacements": replacements,
+        "trash_id": trash_id,
+    }
 
 
 def tool_write_file(agent_id: str, path: str, content: str, reason: str) -> Dict[str, Any]:
