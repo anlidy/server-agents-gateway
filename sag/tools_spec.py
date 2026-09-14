@@ -5,7 +5,7 @@ MCP_TOOLS_SPEC = [
         "name": "hub_shell",
         "description": (
             "Run a command with bash -lc (pipes and redirects work). "
-            "rm goes to the recycle bin via a PATH wrapper; /bin/rm still deletes for real. "
+            "rm is bound to an absolute-path recycle-bin wrapper; /bin/rm still deletes for real. "
             "If you add, remove, or move a service, update SERVER_AGENTS.md Inventory in the same turn."
         ),
         "inputSchema": {

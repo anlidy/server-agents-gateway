@@ -26,7 +26,7 @@ os.environ["GATEWAY_SHELL_TIMEOUT_MAX"] = "10"
 os.environ["AI_PROVIDER_ENABLED"] = "false"
 
 from sag.auth import authenticate_bearer_token, issue_agent_token, revoke_agent_token
-from sag.config import config
+from sag.config import config, resolve_config_path
 from sag.db import (
     append_audit,
     get_audit_event,
@@ -91,6 +91,21 @@ class TestGatewayV2(unittest.TestCase):
 
     def tearDown(self):
         _wipe_db()
+
+    def test_relative_config_paths_anchor_at_gateway_root(self):
+        root = Path("/opt/server-agents-gateway")
+        self.assertEqual(
+            resolve_config_path("./data/gateway.db", root),
+            (root / "data" / "gateway.db").resolve(),
+        )
+        self.assertTrue(resolve_config_path("./data/gateway.db", root).is_absolute())
+        self.assertEqual(
+            resolve_config_path("/var/lib/sag/gateway.db", root),
+            Path("/var/lib/sag/gateway.db").resolve(),
+        )
+        self.assertTrue(Path(config.db_path).is_absolute())
+        self.assertTrue(Path(config.overview_path).is_absolute())
+        self.assertTrue(Path(config.shell_cwd).is_absolute())
 
     def test_auth_per_agent_tokens(self):
         token = issue_agent_token("mobile:agent", role="admin")
@@ -164,6 +179,36 @@ class TestGatewayV2(unittest.TestCase):
         restored = tool_restore_file("test:agent", items[0]["id"], "put back")
         self.assertEqual(restored["status"], "RESTORED")
         self.assertEqual(target.read_text(encoding="utf-8"), "hello-trash")
+
+    def test_rm_relative_operand_stores_absolute_path(self):
+        target = Path(config.shell_cwd) / "rel.txt"
+        target.write_text("rel", encoding="utf-8")
+        result = tool_shell(
+            "test:agent",
+            "rm ./rel.txt",
+            "relative rm",
+            cwd=str(config.shell_cwd),
+        )
+        self.assertEqual(result["exit_code"], 0, msg=result.get("stderr"))
+        self.assertFalse(target.exists())
+        items = list_trash()
+        self.assertTrue(items)
+        stored = Path(items[0]["original_path"])
+        self.assertTrue(stored.is_absolute(), msg=items[0]["original_path"])
+        self.assertEqual(stored, target.resolve())
+
+    def test_rm_wrapper_survives_path_reset(self):
+        target = Path(config.shell_cwd) / "still.txt"
+        target.write_text("keep", encoding="utf-8")
+        result = tool_shell(
+            "test:agent",
+            "PATH=/usr/bin:/bin; rm still.txt",
+            "path reset",
+            cwd=str(config.shell_cwd),
+        )
+        self.assertEqual(result["exit_code"], 0, msg=result.get("stderr"))
+        self.assertFalse(target.exists())
+        self.assertTrue(list_trash())
 
     def test_bin_rm_does_not_enter_trash(self):
         target = Path(config.shell_cwd) / "gone.txt"

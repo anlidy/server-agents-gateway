@@ -1,10 +1,11 @@
 """
-Open bash -lc execution with PATH-injected rm wrapper.
+Open bash -lc execution. rm is bound to the wrapper by absolute path.
 """
 
 from __future__ import annotations
 
 import os
+import shlex
 import signal
 import subprocess
 from pathlib import Path
@@ -48,13 +49,22 @@ def execute_shell(
         raise CommandExecutionError(f"cwd does not exist: {workdir}")
 
     env = os.environ.copy()
-    wrappers = str(config.wrappers_dir)
-    env["PATH"] = wrappers + os.pathsep + env.get("PATH", "")
+    wrappers = Path(config.wrappers_dir).resolve()
+    abs_rm = wrappers / "rm"
+    path = str(wrappers) + os.pathsep + env.get("PATH", "")
+    env["PATH"] = path
     if agent_id:
         env["SAG_AGENT_ID"] = agent_id
+    # Login shells rewrite PATH. Re-export an absolute wrappers dir and bind
+    # rm() to the wrapper's absolute path so `rm ./file` never depends on PATH.
+    setup = (
+        f"PATH={shlex.quote(path)}; export PATH; "
+        f"rm() {{ {shlex.quote(str(abs_rm))} \"$@\"; }}; "
+        f"export -f rm; "
+    )
 
     proc = subprocess.Popen(
-        ["/bin/bash", "-lc", cmd],
+        ["/bin/bash", "-lc", setup + cmd],
         cwd=workdir,
         env=env,
         stdout=subprocess.PIPE,

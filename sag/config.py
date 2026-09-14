@@ -28,23 +28,38 @@ _GATEWAY_ROOT = _PACKAGE_DIR.parent
 _load_env_file(_GATEWAY_ROOT / ".env")
 
 
+def resolve_config_path(value: str, root: Path | None = None) -> Path:
+    """Resolve a config path. Relative values are anchored at gateway root, not cwd."""
+    base = Path(root) if root is not None else _GATEWAY_ROOT
+    p = Path(value).expanduser()
+    if not p.is_absolute():
+        p = base / p
+    return p.resolve()
+
+
 def _default_shell_cwd() -> str:
     explicit = os.getenv("GATEWAY_SHELL_CWD", "").strip()
     if explicit:
-        return explicit
+        return str(resolve_config_path(explicit))
     home = os.getenv("HOME", "").strip()
     if home and Path(home).is_dir():
-        return home
+        return str(Path(home).expanduser().resolve())
     return "/"
 
 
 @dataclass(frozen=True)
 class Config:
-    gateway_root: str = str(_GATEWAY_ROOT)
+    gateway_root: str = str(_GATEWAY_ROOT.resolve())
     host: str = os.getenv("GATEWAY_HOST", "127.0.0.1")
     port: int = int(os.getenv("GATEWAY_PORT", "4180"))
-    db_path: str = os.getenv("GATEWAY_DB_PATH", str(_GATEWAY_ROOT / "data" / "gateway.db"))
-    overview_path: str = os.getenv("GATEWAY_OVERVIEW_PATH", str(_GATEWAY_ROOT / "SERVER_AGENTS.md"))
+    db_path: str = str(
+        resolve_config_path(os.getenv("GATEWAY_DB_PATH", str(_GATEWAY_ROOT / "data" / "gateway.db")))
+    )
+    overview_path: str = str(
+        resolve_config_path(
+            os.getenv("GATEWAY_OVERVIEW_PATH", str(_GATEWAY_ROOT / "SERVER_AGENTS.md"))
+        )
+    )
     root_admin_agent_id: str = os.getenv("ROOT_ADMIN_AGENT_ID", "root:admin")
     shell_cwd: str = _default_shell_cwd()
     shell_timeout_seconds: int = int(os.getenv("GATEWAY_SHELL_TIMEOUT_SECONDS", "120"))
@@ -62,7 +77,7 @@ class Config:
 
     @property
     def wrappers_dir(self) -> Path:
-        return Path(self.gateway_root) / "wrappers"
+        return (Path(self.gateway_root) / "wrappers").resolve()
 
     @property
     def data_dir(self) -> Path:

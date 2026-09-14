@@ -54,7 +54,9 @@ def probe_one(kind: str, spec: str) -> str:
             import urllib.error
             import urllib.request
 
-            req = urllib.request.Request(spec, method="HEAD")
+            req = urllib.request.Request(
+                spec, method="GET", headers={"User-Agent": "sag-probe/2"}
+            )
             try:
                 with urllib.request.urlopen(req, timeout=3) as resp:
                     if 200 <= getattr(resp, "status", 200) < 400:

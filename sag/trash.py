@@ -228,11 +228,13 @@ def trash_from_rm_argv(argv: List[str], agent_id: Optional[str] = None) -> int:
     who = agent_id or os.environ.get("SAG_AGENT_ID") or "unknown"
     errors = False
     for op in operands:
-        p = Path(op)
+        p = Path(op).expanduser()
+        if not p.is_absolute():
+            p = Path.cwd() / p
         try:
             resolved = p.resolve()
         except OSError:
-            resolved = p
+            resolved = Path(os.path.abspath(str(p)))
         if not resolved.exists():
             if not force:
                 print(f"rm: cannot remove '{op}': No such file or directory", file=__import__("sys").stderr)
