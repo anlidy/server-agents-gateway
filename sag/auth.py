@@ -8,7 +8,7 @@ import hmac
 import secrets
 import time
 from typing import Optional, Tuple
-from db import get_db_connection
+from .db import get_db_connection
 
 
 def hash_token(token: str) -> str:
