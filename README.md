@@ -1,6 +1,6 @@
 # Server Agents Gateway
 
-A personal-server hub for multiple AI agents. MCP over HTTP/SSE. Python 3.10+, stdlib only.
+A personal-server hub for multiple AI agents. MCP over Streamable HTTP (`/mcp`; legacy `/sse` still served). Python 3.10+, stdlib only.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
@@ -62,7 +62,7 @@ MCP client:
 {
   "mcpServers": {
     "server-agents-gateway": {
-      "url": "https://gateway.example.com/sse",
+      "url": "https://gateway.example.com/mcp",
       "headers": {
         "Authorization": "Bearer sag_desktop_cursor_YOUR_TOKEN"
       }

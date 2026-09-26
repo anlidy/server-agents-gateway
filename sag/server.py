@@ -1,7 +1,8 @@
 """
-Official-Compliant MCP (Model Context Protocol) Server over SSE and Stdio.
+Official-Compliant MCP (Model Context Protocol) Server over Streamable HTTP.
 Native Python 3.12 asyncio implementation with zero external dependencies.
-Supports bidirectional SSE streaming, JSON-RPC 2.0 lifecycle, and full inputSchema definitions.
+Primary endpoint is POST /mcp (Streamable HTTP, stateless); legacy HTTP+SSE
+(GET /sse + POST /messages) is kept for older clients.
 """
 
 import asyncio
@@ -115,6 +116,9 @@ class SSESession:
 
 _SESSIONS: Dict[str, SSESession] = {}
 
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+KEEPALIVE_SECONDS = 15
+
 
 async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rpc_id = rpc_req.get("id")
@@ -122,11 +126,13 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
     params = rpc_req.get("params", {})
 
     if method == "initialize":
+        requested = (params or {}).get("protocolVersion")
+        version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else SUPPORTED_PROTOCOL_VERSIONS[0]
         return {
             "jsonrpc": "2.0",
             "id": rpc_id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": version,
                 "capabilities": {
                     "tools": {}
                 },
@@ -139,6 +145,9 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
 
     if method == "notifications/initialized":
         return None
+
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": rpc_id, "result": {}}
 
     if method == "tools/list":
         visible_tools = get_tools_for_agent(agent_id, role)
@@ -154,7 +163,8 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
         try:
-            result = dispatch_tool(agent_id, role, tool_name, arguments)
+            # Run in a thread so long shell commands don't stall other clients or keepalives
+            result = await asyncio.to_thread(dispatch_tool, agent_id, role, tool_name, arguments)
             text_val = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
             return {
                 "jsonrpc": "2.0",
@@ -188,6 +198,78 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
             }
         }
     return None
+
+
+def _write_simple(writer: asyncio.StreamWriter, status: str, body: bytes = b"", extra_headers: bytes = b"") -> None:
+    head = f"HTTP/1.1 {status}\r\n".encode()
+    if body:
+        head += b"Content-Type: application/json; charset=utf-8\r\n"
+    head += b"Content-Length: " + str(len(body)).encode() + b"\r\n" + extra_headers + b"Connection: close\r\n\r\n"
+    writer.write(head + body)
+
+
+async def handle_streamable_post(
+    agent_id: str, role: str, headers: Dict[str, str], body_data: bytes, writer: asyncio.StreamWriter
+) -> None:
+    """
+    MCP Streamable HTTP, stateless mode (no Mcp-Session-Id).
+    Notifications/responses only -> 202. Requests -> one SSE stream when the client
+    accepts it (with keepalive pings while tools run), otherwise a plain JSON body.
+    """
+    try:
+        payload = json.loads(body_data.decode("utf-8"))
+    except Exception:
+        err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+        _write_simple(writer, "400 Bad Request", json.dumps(err).encode())
+        return
+
+    is_batch = isinstance(payload, list)
+    messages = payload if is_batch else [payload]
+    if not messages or not all(isinstance(m, dict) for m in messages):
+        err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+        _write_simple(writer, "400 Bad Request", json.dumps(err).encode())
+        return
+
+    has_requests = any("method" in m and m.get("id") is not None for m in messages)
+    if not has_requests:
+        for m in messages:
+            if "method" in m:
+                await handle_jsonrpc(agent_id, role, m)
+        _write_simple(writer, "202 Accepted")
+        return
+
+    async def run_all() -> list:
+        results = await asyncio.gather(*(handle_jsonrpc(agent_id, role, m) for m in messages))
+        return [r for r in results if r]
+
+    if "text/event-stream" not in headers.get("accept", ""):
+        responses = await run_all()
+        out = responses if is_batch else (responses[0] if responses else {})
+        _write_simple(writer, "200 OK", json.dumps(out, ensure_ascii=False).encode("utf-8"))
+        return
+
+    writer.write(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/event-stream; charset=utf-8\r\n"
+        b"Cache-Control: no-cache\r\n"
+        b"X-Accel-Buffering: no\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+    )
+    await writer.drain()
+
+    task = asyncio.create_task(run_all())
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=KEEPALIVE_SECONDS)
+        if done:
+            break
+        writer.write(b": ping\n\n")
+        await writer.drain()
+
+    responses = task.result()
+    data = json.dumps(responses if is_batch else responses[0], ensure_ascii=False)
+    writer.write(f"event: message\ndata: {data}\n\n".encode("utf-8"))
+    await writer.drain()
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -252,7 +334,19 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             writer.close()
             return
 
-        # GET /sse (MCP Standard SSE Connection)
+        # /mcp (MCP Streamable HTTP). No server-initiated stream, so GET/DELETE are 405.
+        if path == "/mcp":
+            if method == "POST":
+                content_length = int(headers.get("content-length", 0))
+                body_data = await reader.readexactly(content_length) if content_length > 0 else b""
+                await handle_streamable_post(agent_id, role, headers, body_data, writer)
+            else:
+                _write_simple(writer, "405 Method Not Allowed", extra_headers=b"Allow: POST\r\n")
+            await writer.drain()
+            writer.close()
+            return
+
+        # GET /sse (legacy HTTP+SSE transport)
         if method == "GET" and path in ("/sse", "/"):
             session_id = str(uuid.uuid4())
             sse_session = SSESession(session_id, agent_id, writer)
@@ -287,8 +381,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 writer.close()
             return
 
-        # POST /messages (MCP Standard Message Endpoint)
-        if method == "POST" and path in ("/messages", "/message", "/rpc", "/mcp"):
+        # POST /messages (legacy HTTP+SSE message endpoint)
+        if method == "POST" and path in ("/messages", "/message", "/rpc"):
             content_length = int(headers.get("content-length", 0))
             body_data = await reader.readexactly(content_length) if content_length > 0 else b"{}"
             try:

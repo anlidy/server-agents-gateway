@@ -1,6 +1,6 @@
 # Server Agents Gateway
 
-个人 Linux 服务器上的多 Agent 协作层。MCP over HTTP/SSE。Python 3.10+，仅标准库。
+个人 Linux 服务器上的多 Agent 协作层。MCP over Streamable HTTP（`/mcp`，旧的 `/sse` 仍保留）。Python 3.10+，仅标准库。
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
