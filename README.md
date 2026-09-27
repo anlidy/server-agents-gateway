@@ -8,7 +8,7 @@ A personal-server hub for multiple AI agents. MCP over Streamable HTTP (`/mcp`; 
 
 **English** | [简体中文](README_zh.md)
 
-Version **2.1.0**. Design notes: [docs/v2.md](docs/v2.md).
+Version **2.3.0**. Design notes: [docs/v2.md](docs/v2.md).
 
 ## What it does
 
@@ -40,7 +40,7 @@ Safety is audit + trash, not a command allowlist.
 | `hub_inbox` / `hub_read_message` / `hub_mark_read` | Unread-first inbox with previews; full read marks read. |
 | `hub_set_group` | Define a recipient group. |
 | `hub_create_task` / `hub_list_tasks` / `hub_update_task` | Handoff: open → claimed → done / cancelled, with a result. |
-| `hub_issue_agent_token` / `hub_revoke_agent_token` | Root admin only. |
+| `hub_issue_agent_token` / `hub_revoke_agent_token` | Root admin only. Revoking also kills the agent's OAuth tokens. |
 
 When an agent has unread messages, other tool results carry a second content item: `[SAG] 你有 N 条未读消息…，用 hub_inbox 查看。` The first item is unchanged.
 
@@ -82,6 +82,10 @@ MCP client:
 ```
 
 Systemd unit: [deploy/server-agents-gateway.service](deploy/server-agents-gateway.service). Ingress: [deploy/DOMAIN_INGRESS.md](deploy/DOMAIN_INGRESS.md).
+
+## claude.ai connector (OAuth)
+
+claude.ai custom connectors (web, desktop, mobile) only speak OAuth. Set `GATEWAY_PUBLIC_URL` and the gateway serves a minimal OAuth 2.1 server: dynamic client registration, PKCE, and a one-time pairing code instead of a login (`python3 -m sag oauth-pair <agent_id>` as root). Tokens map to that agent (always operator). The public hostname only accepts OAuth tokens, not static `sag_` tokens. See [docs/claude-ai.md](docs/claude-ai.md) (Chinese).
 
 ## Layout
 

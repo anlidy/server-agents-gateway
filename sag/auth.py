@@ -15,14 +15,21 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
 
 
-def authenticate_bearer_token(bearer_token: str) -> Optional[Tuple[str, str]]:
+def authenticate_bearer_token(bearer_token: str, allow_static: bool = True) -> Optional[Tuple[str, str]]:
     """
     Validates a Bearer Token against the database.
     Returns (agent_id, role) if valid and ACTIVE, else None.
+    OAuth access tokens (sago_…) are checked in oauth.py; allow_static=False accepts only those.
     """
     if not bearer_token:
         return None
     token_clean = bearer_token.replace("Bearer ", "").strip()
+    if token_clean.startswith("sago_"):
+        from .oauth import authenticate_access_token
+
+        return authenticate_access_token(token_clean)
+    if not allow_static:
+        return None
     token_h = hash_token(token_clean)
 
     with get_db_connection() as conn:
@@ -76,10 +83,15 @@ def issue_agent_token(agent_id: str, role: str = "admin") -> str:
 
 
 def revoke_agent_token(agent_id: str) -> bool:
+    """吊销 agent，连带吊销它名下的 OAuth 令牌（否则日后重新签发时旧的 OAuth 授权会复活）。"""
+    from .oauth import revoke_agent_grants
+
     with get_db_connection() as conn:
         cursor = conn.execute(
             "UPDATE agent_credentials SET status = 'REVOKED' WHERE agent_id = ?;",
             (agent_id,),
         )
         conn.commit()
-        return cursor.rowcount > 0
+        found = cursor.rowcount > 0
+    revoke_agent_grants(agent_id)
+    return found

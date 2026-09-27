@@ -149,6 +149,50 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_task_status ON agent_tasks(status, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_task_assignee ON agent_tasks(assignee, status);
+
+        -- OAuth（claude.ai 连接器），见 oauth.py
+        CREATE TABLE IF NOT EXISTS oauth_clients (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            redirect_uris TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER
+        );
+
+        -- 一次性配对码：root 在服务器上生成，决定授权挂在哪个 agent 上
+        CREATE TABLE IF NOT EXISTS oauth_pairings (
+            code_hash TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            used_at INTEGER,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS oauth_codes (
+            code_hash TEXT PRIMARY KEY,
+            oauth_client_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            scope TEXT,
+            expires_at INTEGER NOT NULL,
+            used_at INTEGER
+        );
+
+        -- kind: access / refresh。同一次授权（含后续刷新）共用 grant_id，吊销按 grant 整体吊销
+        CREATE TABLE IF NOT EXISTS oauth_tokens (
+            token_hash TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            grant_id TEXT NOT NULL,
+            oauth_client_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            scope TEXT,
+            expires_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_oauth_tokens_agent ON oauth_tokens(agent_id, kind);
+        CREATE INDEX IF NOT EXISTS idx_oauth_tokens_grant ON oauth_tokens(grant_id);
         """
         )
         conn.commit()
