@@ -143,9 +143,9 @@ def call_worker(op: str, req: Dict[str, Any], agent_id: str = "", stdin_file=Non
         proc.stdin.write(header)
         if stdin_file is not None:
             shutil.copyfileobj(stdin_file, proc.stdin, 1 << 20)
-        proc.stdin.close()
     except BrokenPipeError:
         pass
+    # 不要自己 close stdin：Python 3.12 的 communicate() 会先 flush stdin，已关闭会抛 ValueError。
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
