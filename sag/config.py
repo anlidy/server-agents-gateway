@@ -47,15 +47,6 @@ def _default_shell_cwd() -> str:
     return "/"
 
 
-_DEFAULT_OAUTH_REDIRECT_URIS = (
-    "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback,loopback"
-)
-
-
-def _csv(value: str) -> tuple:
-    return tuple(v.strip() for v in value.split(",") if v.strip())
-
-
 @dataclass(frozen=True)
 class Config:
     gateway_root: str = str(_GATEWAY_ROOT.resolve())
@@ -76,15 +67,6 @@ class Config:
     audit_body_max_bytes: int = int(os.getenv("GATEWAY_AUDIT_BODY_MAX_BYTES", str(2 * 1024 * 1024)))
     trash_retention_days: int = int(os.getenv("GATEWAY_TRASH_RETENTION_DAYS", "30"))
     reconcile_interval_seconds: int = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
-    # OAuth（claude.ai 连接器）。设了 GATEWAY_PUBLIC_URL 才启用，见 sag/oauth.py。
-    public_url: str = os.getenv("GATEWAY_PUBLIC_URL", "").strip().rstrip("/")
-    oauth_redirect_uris: tuple = _csv(os.getenv("GATEWAY_OAUTH_REDIRECT_URIS", _DEFAULT_OAUTH_REDIRECT_URIS))
-    oauth_access_ttl_minutes: int = int(os.getenv("GATEWAY_OAUTH_ACCESS_TTL_MINUTES", "60"))
-    oauth_refresh_ttl_days: int = int(os.getenv("GATEWAY_OAUTH_REFRESH_TTL_DAYS", "30"))
-    oauth_pairing_ttl_minutes: int = int(os.getenv("GATEWAY_OAUTH_PAIRING_TTL_MINUTES", "10"))
-    # 可选：这些域名上只收 OAuth 令牌，静态 sag_ token 一律 401。
-    # 用于另开一个不挂 CF Access 的域名给 claude.ai、原域名继续挂 Access 的部署；单域名部署留空。
-    oauth_only_hosts: tuple = _csv(os.getenv("GATEWAY_OAUTH_ONLY_HOSTS", ""))
     # Kept so existing .env files still load; unused in v2.
     ai_provider_enabled: bool = os.getenv("AI_PROVIDER_ENABLED", "true").lower() in ("true", "1", "yes")
     ai_provider_base_url: str = os.getenv("AI_PROVIDER_BASE_URL", "http://127.0.0.1:8080/v1")

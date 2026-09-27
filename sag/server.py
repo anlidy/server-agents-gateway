@@ -14,7 +14,7 @@ import urllib.parse
 import uuid
 from typing import Any, Dict, Optional, Set
 
-from . import collab, oauth, oauth_http
+from . import collab
 from .auth import authenticate_bearer_token, issue_agent_token
 from .config import config
 from .db import init_db
@@ -174,7 +174,7 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
                 },
                 "serverInfo": {
                     "name": "server-agents-gateway",
-                    "version": "2.3.0"
+                    "version": "2.1.0"
                 }
             }
         }
@@ -345,31 +345,16 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             writer.close()
             return
 
-        # OAuth: discovery, registration, consent page, token (no bearer needed)
-        if oauth.enabled() and oauth_http.is_oauth_path(path):
-            content_length = int(headers.get("content-length", 0) or 0)
-            if content_length > oauth_http.MAX_BODY_BYTES:
-                resp = oauth_http.Response(413)
-            else:
-                body_data = await reader.readexactly(content_length) if content_length > 0 else b""
-                resp = await asyncio.to_thread(oauth_http.handle, method, path, parsed_url.query, body_data)
-            writer.write(resp.to_bytes())
-            await writer.drain()
-            writer.close()
-            return
-
         # Authenticate Bearer Token
         auth_header = headers.get("authorization", "")
         # Allow token in query parameter for SSE initial connection if header unavailable
         if not auth_header and "token" in query:
             auth_header = f"Bearer {query['token'][0]}"
 
-        # Public (no CF Access) hostnames only take OAuth access tokens
-        host = headers.get("host", "").rsplit(":", 1)[0].strip("[]").lower()
-        allow_static = host not in config.oauth_only_hosts
-        auth_res = await asyncio.to_thread(authenticate_bearer_token, auth_header, allow_static)
+        auth_res = authenticate_bearer_token(auth_header)
         if not auth_res:
-            writer.write(oauth_http.unauthorized().to_bytes())
+            body = b'{"error": "Unauthorized: Invalid or missing Bearer token"}'
+            writer.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
             writer.close()
             return
@@ -518,40 +503,8 @@ def main() -> None:
         agent = sys.argv[2] if len(sys.argv) > 2 else "desktop:cursor"
         token = issue_agent_token(agent, role="operator")
         print(f"Issued operator token for [{agent}]: {token}")
-    elif len(sys.argv) > 1 and sys.argv[1].startswith("oauth-"):
-        init_db()
-        _oauth_cli(sys.argv[1], sys.argv[2:])
     else:
         asyncio.run(run_server())
-
-
-def _oauth_cli(cmd: str, args: list) -> None:
-    if cmd == "oauth-pair":
-        if not args:
-            sys.exit("usage: python3 -m sag oauth-pair <agent_id> [ttl_minutes]")
-        if not oauth.enabled():
-            print("warning: GATEWAY_PUBLIC_URL is not set, OAuth endpoints are off", file=sys.stderr)
-        try:
-            code, expires = oauth.create_pairing(args[0], int(args[1]) if len(args) > 1 else None)
-        except ValueError as e:
-            sys.exit(f"error: {e}")
-        left = max(1, round((expires - time.time()) / 60))
-        print(f"Pairing code for [{args[0]}]: {code}  (one-time, expires in {left} min)")
-        if oauth.enabled():
-            print(f"Connector URL: {oauth.mcp_url()}")
-    elif cmd == "oauth-list":
-        grants = oauth.list_grants()
-        if not grants:
-            print("No active OAuth grants.")
-        for g in grants:
-            print(json.dumps(g, ensure_ascii=False))
-    elif cmd == "oauth-revoke":
-        if not args:
-            sys.exit("usage: python3 -m sag oauth-revoke <agent_id>")
-        n = oauth.revoke_agent_grants(args[0])
-        print(f"Revoked {n} OAuth grant(s) for [{args[0]}]; its static token (if any) is untouched.")
-    else:
-        sys.exit("usage: python3 -m sag oauth-pair <agent_id> [ttl_minutes] | oauth-list | oauth-revoke <agent_id>")
 
 
 if __name__ == "__main__":
