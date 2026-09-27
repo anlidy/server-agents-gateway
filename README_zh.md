@@ -84,7 +84,7 @@ agent 之间要说话（提问、回答、交接、"我改了 X，你看一下 Y
 
 ## claude.ai 连接器（OAuth）
 
-claude.ai 的自定义连接器（网页 / 桌面 / 手机 App）只支持 OAuth。设置 `GATEWAY_PUBLIC_URL` 后网关自带一个最小的 OAuth 2.1 授权服务：动态注册、PKCE，授权页不登录账号，而是填 root 在服务器上用 `python3 -m sag oauth-pair <agent_id>` 生成的一次性配对码。令牌挂在这个 agent 上（一律 operator）。公网域名上只收 OAuth 令牌，不收静态 `sag_` token。详见 [docs/claude-ai.md](docs/claude-ai.md)。
+claude.ai 的自定义连接器（网页 / 桌面 / 手机 App）只支持 OAuth。设置 `GATEWAY_PUBLIC_URL` 后网关自带一个最小的 OAuth 2.1 授权服务：动态注册、PKCE，授权页不登录账号，而是填 root 在服务器上用 `python3 -m sag oauth-pair <agent_id>` 生成的一次性配对码。令牌挂在这个 agent 上（一律 operator）。静态 token 照常可用，同一个域名。详见 [docs/claude-ai.md](docs/claude-ai.md)。
 
 ## 快速开始
 

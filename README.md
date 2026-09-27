@@ -85,7 +85,7 @@ Systemd unit: [deploy/server-agents-gateway.service](deploy/server-agents-gatewa
 
 ## claude.ai connector (OAuth)
 
-claude.ai custom connectors (web, desktop, mobile) only speak OAuth. Set `GATEWAY_PUBLIC_URL` and the gateway serves a minimal OAuth 2.1 server: dynamic client registration, PKCE, and a one-time pairing code instead of a login (`python3 -m sag oauth-pair <agent_id>` as root). Tokens map to that agent (always operator). The public hostname only accepts OAuth tokens, not static `sag_` tokens. See [docs/claude-ai.md](docs/claude-ai.md) (Chinese).
+claude.ai custom connectors (web, desktop, mobile) only speak OAuth. Set `GATEWAY_PUBLIC_URL` and the gateway serves a minimal OAuth 2.1 server: dynamic client registration, PKCE, and a one-time pairing code instead of a login (`python3 -m sag oauth-pair <agent_id>` as root). Tokens map to that agent (always operator). Static tokens keep working on the same hostname. See [docs/claude-ai.md](docs/claude-ai.md) (Chinese).
 
 ## Layout
 

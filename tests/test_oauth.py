@@ -213,6 +213,13 @@ class TestOAuth(unittest.TestCase):
         self.assertEqual(self.mcp(static, host="gateway.example.com")[0], 200)
         self.assertEqual(self.mcp(static, host="127.0.0.1:4180")[0], 200)
 
+    def test_single_domain_accepts_both_token_kinds(self):
+        _set(oauth_only_hosts=())
+        static = issue_agent_token("wsl:claude", role="operator")
+        _, tok = self.full_flow()
+        self.assertEqual(self.mcp(static)[0], 200)
+        self.assertEqual(self.mcp(tok["access_token"])[0], 200)
+
     def test_pairing_code_is_one_time_and_wrong_code_rejected(self):
         cid = self.register()
         pairing, _ = oauth.create_pairing("claude:web")
