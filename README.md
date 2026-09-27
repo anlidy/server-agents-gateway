@@ -8,7 +8,7 @@ A personal-server hub for multiple AI agents. MCP over Streamable HTTP (`/mcp`; 
 
 **English** | [简体中文](README_zh.md)
 
-Version **2.1.0**. Design notes: [docs/v2.md](docs/v2.md).
+Version **2.2.0**. Design notes: [docs/v2.md](docs/v2.md).
 
 ## What it does
 
@@ -22,7 +22,7 @@ Several agents (phone, desktop IDE, a cron job) share one Linux box. The gateway
 
 Safety is audit + trash, not a command allowlist.
 
-**No sandbox.** The gateway runs as root and the systemd unit sets no `ProtectSystem` / `ProtectHome` / `PrivateTmp`: `hub_shell` can write `/etc`, `/usr`, `/root`, manage systemd units, and shares `/tmp` with SSH sessions. What remains: full audit log, recycle bin, secret redaction in audit, and self-protection of `data/` and `.env`. **A leaked token is a leaked root shell** — only issue tokens to agents you trust, one per client, and revoke unused ones.
+**Two privilege levels, enforced by the OS.** The service runs as root with no systemd sandbox. Agents whose token role is `admin` act as root. Every other agent (operator) runs `hub_shell` and all file tools as the unprivileged Unix user `sag-operator` (no sudo, no docker, `no_new_privs`, clean env), so the kernel decides what it may read, write or delete. Operators can write their home, `/tmp`, admin-granted paths (POSIX ACL via `hub_grant_path`) and `SERVER_AGENTS.md` (written by SAG as root, audited). SAG's own code, `data/`, `.env` and unit are root-only; `gateway.db` and `.env` are `600`. When an operator needs root it files `hub_request_elevation`; an admin approves (`hub_approve_elevation` or `sudo python3 -m sag elevation approve <id>`) and SAG runs the stored request verbatim as root, then messages the result back. Run `sudo bash scripts/setup_operator.sh` once on the server. **A leaked admin token is a leaked root shell.**
 
 ## Tools
 
@@ -40,6 +40,9 @@ Safety is audit + trash, not a command allowlist.
 | `hub_inbox` / `hub_read_message` / `hub_mark_read` | Unread-first inbox with previews; full read marks read. |
 | `hub_set_group` | Define a recipient group. |
 | `hub_create_task` / `hub_list_tasks` / `hub_update_task` | Handoff: open → claimed → done / cancelled, with a result. |
+| `hub_request_elevation` / `hub_list_elevations` | Operator asks for a root action; view own requests/results. |
+| `hub_approve_elevation` / `hub_reject_elevation` | Admin: approve (runs verbatim as root) or reject. |
+| `hub_grant_path` / `hub_revoke_grant` / `hub_list_grants` | Admin grants a path to operators via ACL; anyone can list. |
 | `hub_issue_agent_token` / `hub_revoke_agent_token` | Root admin only. |
 
 When an agent has unread messages, other tool results carry a second content item: `[SAG] 你有 N 条未读消息…，用 hub_inbox 查看。` The first item is unchanged.

@@ -14,9 +14,9 @@ KillMode=mixed
 TimeoutStopSec=15
 
 # 故意不加 ProtectSystem / ProtectHome / PrivateTmp 等沙箱选项：
-# hub_shell 需要真正的 root（能改 /etc、/usr、/root，装服务、改 systemd），
-# /tmp 也要和 SSH 会话共享。安全网是审计日志 + 回收站 + 审计脱敏，
-# 不是文件系统隔离。持有任意 token = 持有这台机器的 root，只给可信 agent 签发。
+# admin agent 的 hub_shell 需要真正的 root（改 /etc、装服务、改 systemd），/tmp 与宿主共享。
+# 非 admin（operator）agent 由 SAG 自己降权到普通用户 sag-operator 执行，
+# 见 scripts/setup_operator.sh 与 README_zh「权限与风险」。admin token = root，只给可信 agent。
 
 [Install]
 WantedBy=multi-user.target

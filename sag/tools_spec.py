@@ -5,7 +5,7 @@ MCP_TOOLS_SPEC = [
         "name": "hub_shell",
         "description": (
             "Run a command with bash -lc (pipes and redirects work). "
-            "Runs as root on the host with no sandbox: /etc, /usr, /root and systemd are writable, "
+            "Admin agents run as root on the host with no sandbox: /etc, /usr, /root and systemd are writable, "
             "and /tmp is the same /tmp that SSH sessions see. Every call is audited. "
             "rm is bound to an absolute-path recycle-bin wrapper; /bin/rm still deletes for real. "
             "If you add, remove, or move a service, update the matching ### in SERVER_AGENTS.md "
@@ -367,4 +367,164 @@ MCP_TOOLS_SPEC = [
     },
 ]
 
+MCP_TOOLS_SPEC += [
+    {
+        "name": "hub_request_elevation",
+        "description": (
+            "Ask an admin to run something as root for you. Use this whenever you hit Permission denied "
+            "or need root (systemctl restart/reload, docker, apt, editing /etc or other root-owned files, "
+            "running deploy scripts with sudo). Do not try to work around the restriction. "
+            "kind=shell: command (+ optional cwd, timeout_seconds). kind=write_file: path + content. "
+            "kind=patch_file: path + old_string + new_string (+ replace_all). reason is required. "
+            "The request is stored as-is (the admin cannot alter it), admins are messaged, and it expires "
+            "after 24h. When it is approved and executed you get a message with stdout/stderr/exit code/diff."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["shell", "write_file", "patch_file"]},
+                "reason": {"type": "string", "description": "Why this needs root"},
+                "command": {"type": "string"},
+                "cwd": {"type": "string"},
+                "timeout_seconds": {"type": "integer"},
+                "path": {"type": "string", "description": "Absolute path (write_file/patch_file)"},
+                "content": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {"type": "boolean", "default": False},
+            },
+            "required": ["kind", "reason"],
+        },
+    },
+    {
+        "name": "hub_list_elevations",
+        "description": (
+            "List elevation requests. status: pending (default) | approved | executed | failed | rejected | "
+            "expired | all. request_id returns one request with full payload and result. "
+            "Operators only see their own requests."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "default": "pending"},
+                "request_id": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+            },
+        },
+    },
+    {
+        "name": "hub_approve_elevation",
+        "description": (
+            "[Admin] Approve a pending elevation request; SAG runs the stored payload as root exactly as "
+            "submitted (it cannot be changed here) and messages the requester the result. Read it first "
+            "with hub_list_elevations(request_id=...)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"request_id": {"type": "string"}, "note": {"type": "string"}},
+            "required": ["request_id"],
+        },
+    },
+    {
+        "name": "hub_reject_elevation",
+        "description": "[Admin] Reject a pending elevation request. The requester is messaged.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"request_id": {"type": "string"}, "note": {"type": "string"}},
+            "required": ["request_id"],
+        },
+    },
+    {
+        "name": "hub_grant_path",
+        "description": (
+            "[Admin] Let operator agents (Unix group sag-operators) read+write (access=rw) or read (ro) a "
+            "directory or file, via POSIX ACL including inherited default ACLs. Refuses system trees whose "
+            "write access equals root and SAG's own directories. Granting write on anything root executes "
+            "(scripts, units, configs of root services) effectively hands out root."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "access": {"type": "string", "enum": ["rw", "ro"], "default": "rw"},
+                "reason": {"type": "string"},
+            },
+            "required": ["path", "reason"],
+        },
+    },
+    {
+        "name": "hub_revoke_grant",
+        "description": "[Admin] Remove the sag-operators ACL entries from a path (recursively).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "reason": {"type": "string"}},
+            "required": ["path", "reason"],
+        },
+    },
+    {
+        "name": "hub_list_grants",
+        "description": "List paths an admin granted to operator agents (group sag-operators) and their access.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
 ADMIN_ONLY_TOOL_NAMES = {"hub_issue_agent_token", "hub_revoke_agent_token"}
+# role=admin 才能用（不要求是 root admin 本人）
+ADMIN_ROLE_TOOL_NAMES = {"hub_approve_elevation", "hub_reject_elevation", "hub_grant_path", "hub_revoke_grant"}
+
+_OP = (
+    "You run as the unprivileged Unix user sag-operator: no sudo, no docker, cannot write /etc, /usr, "
+    "/opt/server-agents-gateway or other users' files, cannot read secrets such as .env or gateway.db. "
+    "Writable: your home, /tmp (shared with the host), and paths an admin granted (hub_list_grants). "
+    "If you need root, call hub_request_elevation; do not try to work around the restriction."
+)
+
+OPERATOR_DESCRIPTIONS = {
+    "hub_shell": (
+        "Run a command with bash -lc as sag-operator (HOME and default cwd = its home, clean env). "
+        + _OP
+        + " rm moves files to the recycle bin only if you could delete (and read) them; /bin/rm deletes "
+        "for real. Every call is audited. If you add, remove, or move a service, update the matching ### "
+        "in SERVER_AGENTS.md Inventory in the same turn."
+    ),
+    "hub_read_file": "Read a UTF-8 text file with sag-operator's permissions. " + _OP,
+    "hub_list_dir": "List a directory (non-recursive) with sag-operator's permissions. Caps at 2000 entries.",
+    "hub_mkdir": "mkdir -p as sag-operator. " + _OP,
+    "hub_write_file": (
+        "Write a text file as sag-operator (old content goes to the recycle bin). Exception: "
+        "SERVER_AGENTS.md is written by SAG as root and audited, so keep ## Inventory up to date when you "
+        "change topology. For any other root-owned file use hub_request_elevation(kind=write_file). " + _OP
+    ),
+    "hub_patch_file": (
+        "Replace old_string with new_string in a text file as sag-operator (must match once unless "
+        "replace_all; old content to the recycle bin). SERVER_AGENTS.md is the one root-owned file you may "
+        "patch (SAG writes it as root, audited). Otherwise use hub_request_elevation(kind=patch_file). " + _OP
+    ),
+    "hub_delete_file": (
+        "Move a file or directory to the recycle bin, only if sag-operator is allowed to delete it (and can "
+        "read it for the backup). Update SERVER_AGENTS.md Inventory if this removes a service. " + _OP
+    ),
+    "hub_list_trash": "List recycle-bin entries deleted by operator agents (metadata only).",
+    "hub_restore_file": (
+        "Restore an operator-deleted recycle-bin item as sag-operator. Items deleted with root privileges "
+        "can only be restored by an admin."
+    ),
+    "hub_query_audit_logs": "List your own audit events (no bodies). Use hub_get_audit_event for full output.",
+    "hub_get_audit_event": "Fetch one of your own audit events including stdout/stderr/diff.",
+}
+
+
+def tools_for(privileged: bool, root_admin: bool) -> list:
+    out = []
+    for t in MCP_TOOLS_SPEC:
+        name = t["name"]
+        if name in ADMIN_ONLY_TOOL_NAMES and not root_admin:
+            continue
+        if name in ADMIN_ROLE_TOOL_NAMES and not privileged:
+            continue
+        if not privileged and name in OPERATOR_DESCRIPTIONS:
+            t = dict(t, description=OPERATOR_DESCRIPTIONS[name])
+        if name == "hub_request_elevation" and privileged:
+            continue  # admin 本来就是 root
+        out.append(t)
+    return out

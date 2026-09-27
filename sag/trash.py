@@ -135,24 +135,97 @@ def trash_put(
     return item_id
 
 
-def list_trash(prefix: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+TAR_PAYLOAD = "payload.tar"
+
+
+def is_operator_payload(item: Dict[str, Any]) -> bool:
+    """operator 删除的条目以 tar 存放，只能以 operator 身份还原。"""
+    return str(item.get("stored_relpath") or "").endswith("/" + TAR_PAYLOAD)
+
+
+def store_tar_payload(
+    src,
+    original_path: str,
+    is_dir: bool,
+    size_bytes: int,
+    agent_id: str,
+    source: str,
+) -> str:
+    """把 operator 打好的 tar（文件对象）拷进回收站。root 只拷贝，不解包。"""
+    item_id = str(uuid.uuid4())
+    trash_dir = Path(config.db_path).resolve().parent / "trash" / item_id
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(trash_dir, 0o700)
+    payload = trash_dir / TAR_PAYLOAD
+    with open(payload, "wb") as dst:
+        shutil.copyfileobj(src, dst, 1 << 20)
+    now = _now()
+    expires = now + timedelta(days=config.trash_retention_days)
+    rel = f"trash/{item_id}/{TAR_PAYLOAD}"
+    meta = {
+        "id": item_id,
+        "original_path": original_path,
+        "stored_relpath": rel,
+        "deleted_by": agent_id,
+        "deleted_at": _iso(now),
+        "expires_at": _iso(expires),
+        "source": source,
+        "audit_id": None,
+        "is_dir": is_dir,
+        "size_bytes": size_bytes,
+    }
+    (trash_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO trash_items (
+                id, original_path, stored_relpath, deleted_by, deleted_at,
+                expires_at, source, audit_id, is_dir, size_bytes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?);
+            """,
+            (item_id, original_path, rel, agent_id, meta["deleted_at"], meta["expires_at"],
+             source, 1 if is_dir else 0, size_bytes),
+        )
+        conn.commit()
+    return item_id
+
+
+def get_trash_item(item_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM trash_items WHERE id = ?;", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_trash(prefix: Optional[str] = None, limit: int = 50, operator_only: bool = False) -> List[Dict[str, Any]]:
     sql = "SELECT * FROM trash_items"
     params: List[Any] = []
+    cond: List[str] = []
     if prefix:
-        sql += " WHERE original_path LIKE ?"
+        cond.append("original_path LIKE ?")
         params.append(prefix + "%")
+    if operator_only:
+        cond.append("stored_relpath LIKE ?")
+        params.append("%/" + TAR_PAYLOAD)
+    if cond:
+        sql += " WHERE " + " AND ".join(cond)
     sql += " ORDER BY deleted_at DESC LIMIT ?;"
     params.append(max(1, min(int(limit), 200)))
     with get_db_connection() as conn:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
-def restore_trash(item_id: str) -> Dict[str, Any]:
-    with get_db_connection() as conn:
-        row = conn.execute("SELECT * FROM trash_items WHERE id = ?;", (item_id,)).fetchone()
-        if not row:
-            return {"status": "FAILED", "error": "trash item not found"}
-        item = dict(row)
+def restore_trash(item_id: str, as_operator: bool = False, agent_id: str = "") -> Dict[str, Any]:
+    item = get_trash_item(item_id)
+    if not item:
+        return {"status": "FAILED", "error": "trash item not found"}
+    if is_operator_payload(item):
+        return _restore_tar_item(item, agent_id)
+    if as_operator:
+        return {
+            "status": "FAILED",
+            "error": "this item was deleted with root privileges; only an admin can restore it "
+            "(or ask via hub_request_elevation)",
+        }
     dest = Path(item["original_path"])
     payload = Path(config.db_path).resolve().parent / item["stored_relpath"]
     if not payload.exists():
@@ -167,6 +240,27 @@ def restore_trash(item_id: str) -> Dict[str, Any]:
         conn.execute("DELETE FROM trash_items WHERE id = ?;", (item_id,))
         conn.commit()
     return {"status": "RESTORED", "path": str(dest), "trash_id": item_id}
+
+
+def _restore_tar_item(item: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
+    # 不论谁调用，operator 删除的内容都以 operator 身份解包还原：
+    # 路径和 tar 内容都来自 operator，root 解包会被利用来往任意位置写文件。
+    from .privilege import restore_tar_as_operator
+
+    payload = Path(config.db_path).resolve().parent / item["stored_relpath"]
+    if not payload.exists():
+        return {"status": "FAILED", "error": "payload missing"}
+    try:
+        restore_tar_as_operator(payload, item["original_path"], agent_id)
+    except FileExistsError:
+        return {"status": "FAILED", "error": "destination exists", "path": item["original_path"]}
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {"status": "FAILED", "error": f"{type(exc).__name__}: {exc}", "path": item["original_path"]}
+    shutil.rmtree(payload.parent, ignore_errors=True)
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM trash_items WHERE id = ?;", (item["id"],))
+        conn.commit()
+    return {"status": "RESTORED", "path": item["original_path"], "trash_id": item["id"], "restored_as": "operator"}
 
 
 def purge_expired_trash() -> int:

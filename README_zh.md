@@ -8,7 +8,7 @@
 
 [English](README.md) | **简体中文**
 
-版本 **2.1.0**。设计说明：[docs/v2.md](docs/v2.md)。
+版本 **2.2.0**。设计说明：[docs/v2.md](docs/v2.md)。
 
 ## 做什么
 
@@ -24,24 +24,41 @@
 
 ## 权限与风险（请先读）
 
-网关以 **root** 运行，systemd 单元**不带任何沙箱**（没有 `ProtectSystem` / `ProtectHome` / `PrivateTmp`）：
+systemd 单元以 root 运行 SAG，本身不带沙箱（没有 `ProtectSystem` / `ProtectHome` / `PrivateTmp`）。**权限按 token 的角色分两级**，在操作系统层面生效：
 
-- `hub_shell` 和文件工具能改 `/etc`、`/usr`、`/root`，能装服务、改 systemd 单元；
-- `/tmp` 与宿主、SSH 会话是同一个。
+| | admin（`role=admin`，如 `mobile:xiaoyao`） | operator（其他所有 agent） |
+| :--- | :--- | :--- |
+| 执行身份 | root | 普通 Unix 用户 `sag-operator`（主组 `sag-operators`） |
+| `hub_shell` | 完整 root | 以 `sag-operator` 运行：`setpriv --no-new-privs`、清空附加组、干净的环境变量（HOME/PATH 等），默认 cwd 是它的 home |
+| 文件工具 | root 直接做 | 在以 `sag-operator` 身份运行的子进程（`sag/opworker.py`）里做，能不能读写删由内核判定 |
+| 可写 | 全部 | 自己的 home、`/tmp`、admin 授权过的目录（`hub_list_grants`），以及 `SERVER_AGENTS.md`（唯一例外，SAG 以 root 代写并记审计） |
+| 不能 | — | sudo、docker、写 `/etc` `/usr` 等系统目录、改 SAG 自己（代码、`data/`、`.env`、单元文件）、读 `gateway.db` 和 `.env`、签发/吊销 token |
+| 审计 | 全部 | 只能查自己的 |
+| 需要 root 时 | — | `hub_request_elevation` 提交，admin 批准后 SAG 以 root 原样执行 |
 
-这是有意的：个人服务器上 agent 要真正干活，绕道 SSH 反而更不可控。保留的安全网：
+**提权审批**：operator 用 `hub_request_elevation` 提交 shell 命令（带 cwd/timeout）、写文件或改文件，必须附理由。请求原样存库（记 sha256），通过协作消息通知所有 admin，24 小时后过期。admin 用 `hub_list_elevations` / `hub_approve_elevation` / `hub_reject_elevation` 处理；批准时只能批准或拒绝，不能改内容。执行结果（stdout、stderr、退出码、diff）脱敏后存下来并发消息给申请人，全程记审计。你本人也可以在服务器上直接审批：
 
-- **审计**：每次改机器的调用都写 SQLite（命令、stdout/stderr、diff），可回放；
-- **回收站**：`hub_delete_file`、覆盖写、`hub_patch_file`、shell 里的 `rm` 都先进回收站（`/bin/rm` 仍是真删）；
-- **脱敏**：token、Bearer 头、常见 API key 进审计前打码（`sag/audit_redact.py`）；
-- **自保**：文件工具和 `rm` 包装器不碰 `data/`（数据库、回收站）和 `.env`，避免误删审计本身。
+```bash
+sudo python3 -m sag elevation list          # 待审批
+sudo python3 -m sag elevation show e_xxxx   # 完整内容
+sudo python3 -m sag elevation approve e_xxxx --note "ok"
+sudo python3 -m sag elevation reject  e_xxxx --note "不行"
+```
 
-**风险：任何一个 token 泄露，等于这台服务器的 root 泄露。** 建议：
+**目录授权**：`hub_grant_path(path, access=rw|ro)`（仅 admin）或 `sudo python3 -m sag grant add <path> [--ro] --reason …`，用 POSIX ACL 给 `sag-operators` 组加权限（含默认 ACL，新文件继承）。拒绝授权系统目录（`/etc/systemd`、`/usr`、sudoers、cron、pam 等）和 SAG 自己的目录。注意：**给 operator 写任何会被 root 执行或读取的东西（部署脚本、root 服务的配置、定时任务），就等于把 root 交出去。**
 
-1. 只给你信任、且确实需要改机器的 agent 签发 token，一端一个，不共用；
-2. 不用的 agent 立刻 `hub_revoke_agent_token`；
-3. 公网只经 Cloudflare Tunnel 暴露，不要在防火墙放行 4180；
-4. 定期用 `hub_query_audit_logs` 看一眼谁做了什么。
+**回收站**：operator 的 `rm` / `hub_delete_file` 先以 operator 身份把目标打成 tar、再以 operator 身份删除；删不了或读不了（无法备份）就失败，什么都不动。root 进程只把 tar 拷进回收站、从不解包；还原也以 operator 身份解包。root 删掉的东西只有 admin 能还原。
+
+**仍然保留的安全网**：审计、回收站、审计脱敏（`sag/audit_redact.py`）、`data/` 与 `.env` 的自保。
+
+**风险**：
+
+1. **admin token 泄露 = 服务器 root 泄露。** operator token 泄露 = 一个能读大部分系统文件、能访问本机 127.0.0.1 上各服务的普通用户（本机服务自己的鉴权就是最后一道门，比如 Caddy 的 admin API `127.0.0.1:2019` 默认不鉴权）。只给可信 agent 签发 token，一端一个，不用的立刻吊销。
+2. SSH 是另一条路：能 SSH 登录 `ubuntu`（免密 sudo）的 agent 不受上面任何限制。
+3. 批准提权前看清命令本身；批准就是以 root 执行。
+4. 公网只经 Cloudflare Tunnel，不要在防火墙放行 4180；定期 `hub_query_audit_logs` 看一眼。
+
+首次启用（或重装）在服务器上运行一次：`sudo bash scripts/setup_operator.sh`（建用户、把 SAG 目录改成 root 独有、`gateway.db` 与 `.env` 改成 root 600）。
 
 ## 工具
 
@@ -59,6 +76,9 @@
 | `hub_inbox` / `hub_read_message` / `hub_mark_read` | 收件箱（默认只看未读）、读全文并标已读、批量标已读。 |
 | `hub_set_group` | 定义收件组，发送时写 `@组名`。 |
 | `hub_create_task` / `hub_list_tasks` / `hub_update_task` | 任务交接：open → claimed → done / cancelled，附结果。 |
+| `hub_request_elevation` / `hub_list_elevations` | operator 申请以 root 执行；查看自己的申请和结果。 |
+| `hub_approve_elevation` / `hub_reject_elevation` | 仅 admin：批准（以 root 原样执行）或拒绝。 |
+| `hub_grant_path` / `hub_revoke_grant` / `hub_list_grants` | admin 用 ACL 授权目录给 operator；所有人可列出。 |
 | `hub_issue_agent_token` / `hub_revoke_agent_token` | 仅 root admin。 |
 
 ## Agent 协作
