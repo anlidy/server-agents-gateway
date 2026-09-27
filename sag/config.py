@@ -11,7 +11,12 @@ from pathlib import Path
 def _load_env_file(filepath: Path) -> None:
     if not filepath.exists():
         return
-    with open(filepath, "r", encoding="utf-8") as f:
+    try:
+        f = open(filepath, "r", encoding="utf-8")
+    except PermissionError:
+        # .env 是 root 600；非 root 进程（测试、operator）读不到，用环境变量和默认值即可
+        return
+    with f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
