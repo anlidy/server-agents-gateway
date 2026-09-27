@@ -614,7 +614,8 @@ def unread_hint(agent: str) -> Optional[str]:
         subj = subj[:40] + "…"
     who = latest["from_agent"] if latest else "?"
     detail = f"最新来自 {who}" + (f"：{subj}" if subj else "")
-    return f"[SAG] 你有 {n} 条未读消息（{detail}），用 hub_inbox 查看。"
+    # 以换行开头：有的客户端把多个 content 项直接拼接，这样提示会单独成一行
+    return f"\n[SAG] 你有 {n} 条未读消息（{detail}），用 hub_inbox 查看。"
 
 
 # ---------------------------------------------------------------------------

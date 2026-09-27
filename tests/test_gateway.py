@@ -715,6 +715,7 @@ class TestCollab(unittest.TestCase):
         self.assertEqual(len(content), 2)
         # 第一项仍是原来的 JSON，结构不变
         self.assertEqual(json.loads(content[0]["text"])["path"], str(Path(cwd).resolve()))
+        self.assertTrue(content[1]["text"].startswith("\n[SAG] "))
         self.assertIn("1 条未读", content[1]["text"])
         self.assertIn("wsl:pi", content[1]["text"])
         self.assertIn("hub_inbox", content[1]["text"])
