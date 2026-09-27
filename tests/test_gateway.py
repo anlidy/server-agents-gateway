@@ -659,6 +659,15 @@ class TestCollab(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._call("cursor:helm", "hub_send_message", to="wsl:pi", body="x", thread_id=q["thread_id"])
 
+    def test_reply_to_note_to_self(self):
+        note = self._call("wsl:pi", "hub_send_message", to="wsl:pi", subject="备忘", body="记一下")
+        r = self._call("wsl:pi", "hub_reply", message_id=note["id"], body="补充")
+        self.assertEqual(r["recipients"], ["wsl:pi"])
+        self.assertEqual(r["thread_id"], note["thread_id"])
+        thread = self._call("wsl:pi", "hub_inbox", thread_id=note["thread_id"])
+        self.assertEqual(len(thread["messages"]), 2)
+        self.assertEqual(thread["unread_total"], 0)
+
     def test_mark_read(self):
         a = self._call("wsl:pi", "hub_send_message", to="cursor:helm", body="1")
         self._call("wsl:pi", "hub_send_message", to="cursor:helm", body="2")

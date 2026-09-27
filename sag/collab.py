@@ -366,6 +366,14 @@ def reply(
             ):
                 if r["agent_id"] != sender and r["agent_id"] not in targets:
                     targets.append(r["agent_id"])
+        if not targets and orig["from_agent"] == sender:
+            # 发给自己的备忘，回复也回到自己
+            self_rcpt = conn.execute(
+                "SELECT 1 FROM agent_message_recipients WHERE message_id = ? AND agent_id = ?;",
+                (orig["id"], sender),
+            ).fetchone()
+            if self_rcpt:
+                targets.append(sender)
         active = set(_active_agents(conn))
         targets = [t for t in targets if t in active]
         if not targets:
