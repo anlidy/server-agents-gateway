@@ -8,7 +8,7 @@ A personal-server hub for multiple AI agents. MCP over Streamable HTTP (`/mcp`; 
 
 **English** | [简体中文](README_zh.md)
 
-Version **2.0.0**. Design notes: [docs/v2.md](docs/v2.md).
+Version **2.1.0**. Design notes: [docs/v2.md](docs/v2.md).
 
 ## What it does
 
@@ -18,6 +18,7 @@ Several agents (phone, desktop IDE, a cron job) share one Linux box. The gateway
 2. **Records** every tool call (command, files, output) in SQLite.
 3. **Hands** them a real shell (`bash -lc`) plus read/write/delete tools. Deletes go to a recycle bin.
 4. **Keeps** a shared markdown map (`SERVER_AGENTS.md`): you write Inventory, the gateway refreshes the status fence.
+5. **Lets agents talk**: native messages (inbox, threads, read receipts) and task handoff, instead of leaving notes in files.
 
 Safety is audit + trash, not a command allowlist.
 
@@ -34,7 +35,14 @@ Safety is audit + trash, not a command allowlist.
 | `hub_get_overview` / `hub_rebuild_overview` | Read `SERVER_AGENTS.md`; rebuild only refreshes the status fence. |
 | `hub_get_status` | Load, memory, disks, failed units, probes. |
 | `hub_query_audit_logs` / `hub_get_audit_event` | Event list vs full stdout/stderr. |
+| `hub_list_agents` | Issued agents, last activity, groups (no tokens). |
+| `hub_send_message` / `hub_reply` | Message another agent, `*`, `prefix:*` or `@group`; reply in thread. Sender comes from the token. |
+| `hub_inbox` / `hub_read_message` / `hub_mark_read` | Unread-first inbox with previews; full read marks read. |
+| `hub_set_group` | Define a recipient group. |
+| `hub_create_task` / `hub_list_tasks` / `hub_update_task` | Handoff: open → claimed → done / cancelled, with a result. |
 | `hub_issue_agent_token` / `hub_revoke_agent_token` | Root admin only. |
+
+When an agent has unread messages, other tool results carry a second content item: `[SAG] 你有 N 条未读消息…，用 hub_inbox 查看。` The first item is unchanged.
 
 ## Quick start
 

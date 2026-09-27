@@ -100,6 +100,55 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_trash_path ON trash_items(original_path);
         CREATE INDEX IF NOT EXISTS idx_trash_exp ON trash_items(expires_at);
+
+        -- Agent 协作：消息。to_agent 保存发件时写的收件人表达式
+        -- （agent_id / * / wsl:* / @组名，可逗号分隔），实际收件人展开到 agent_message_recipients。
+        CREATE TABLE IF NOT EXISTS agent_messages (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            reply_to TEXT,
+            from_agent TEXT NOT NULL,
+            to_agent TEXT NOT NULL,
+            subject TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL,
+            task_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_msg_thread ON agent_messages(thread_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_msg_from ON agent_messages(from_agent, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS agent_message_recipients (
+            message_id TEXT NOT NULL REFERENCES agent_messages(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL,
+            read_at TEXT,
+            PRIMARY KEY (message_id, agent_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rcpt_agent ON agent_message_recipients(agent_id, read_at);
+
+        CREATE TABLE IF NOT EXISTS agent_groups (
+            group_name TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            added_by TEXT NOT NULL,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (group_name, agent_id)
+        );
+
+        -- Agent 协作：任务。status: open / claimed / done / cancelled
+        CREATE TABLE IF NOT EXISTS agent_tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            created_by TEXT NOT NULL,
+            assignee TEXT,
+            result TEXT,
+            thread_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            closed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_status ON agent_tasks(status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_task_assignee ON agent_tasks(assignee, status);
         """
         )
         conn.commit()

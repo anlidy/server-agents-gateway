@@ -14,6 +14,7 @@ import urllib.parse
 import uuid
 from typing import Any, Dict, Optional, Set
 
+from . import collab
 from .auth import authenticate_bearer_token, issue_agent_token
 from .config import config
 from .db import init_db
@@ -51,6 +52,18 @@ def get_tools_for_agent(agent_id: str, role: str) -> list:
     return [t for t in MCP_TOOLS_SPEC if t["name"] not in ADMIN_ONLY_TOOL_NAMES]
 
 
+_SPOOF_KEYS = ("from", "from_agent", "sender", "created_by", "agent_id")
+_SENDER_TOOLS = {"hub_send_message", "hub_reply", "hub_create_task", "hub_update_task", "hub_set_group"}
+
+
+def _reject_spoofing(tool_name: str, args: Dict[str, Any]) -> None:
+    bad = [k for k in _SPOOF_KEYS if k in args]
+    if bad:
+        raise ValueError(
+            f"{tool_name}: '{bad[0]}' is not accepted; the sender is always the agent_id of your token"
+        )
+
+
 def dispatch_tool(agent_id: str, role: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
     # Strict isolation: if tool is admin-only, deny callers other than the configured root admin as unknown tools
     if tool_name in ADMIN_ONLY_TOOL_NAMES:
@@ -58,7 +71,9 @@ def dispatch_tool(agent_id: str, role: str, tool_name: str, arguments: Dict[str,
             raise ValueError(f"Unknown MCP tool: {tool_name}")
 
     # Filter out client-side synthetic kwargs (e.g. Operit internal metadata)
-    cleaned_args = {k: v for k, v in arguments.items() if not k.startswith("__")}
+    cleaned_args = {k: v for k, v in (arguments or {}).items() if not k.startswith("__")}
+    if tool_name in _SENDER_TOOLS:
+        _reject_spoofing(tool_name, cleaned_args)
 
     if tool_name == "hub_shell":
         return tool_shell(agent_id, **cleaned_args)
@@ -88,6 +103,27 @@ def dispatch_tool(agent_id: str, role: str, tool_name: str, arguments: Dict[str,
         return tool_query_audit_logs(**cleaned_args)
     elif tool_name == "hub_get_audit_event":
         return tool_get_audit_event(cleaned_args.get("id") or cleaned_args.get("event_id"))
+    elif tool_name == "hub_list_agents":
+        return collab.list_agents(agent_id, **cleaned_args)
+    elif tool_name == "hub_set_group":
+        return collab.set_group(agent_id, **cleaned_args)
+    elif tool_name == "hub_send_message":
+        return collab.send_message(agent_id, **cleaned_args)
+    elif tool_name == "hub_reply":
+        return collab.reply(agent_id, **cleaned_args)
+    elif tool_name == "hub_inbox":
+        return collab.inbox(agent_id, **cleaned_args)
+    elif tool_name == "hub_read_message":
+        mid = cleaned_args.pop("message_id", None) or cleaned_args.pop("id", None)
+        return collab.read_message(agent_id, mid, **cleaned_args)
+    elif tool_name == "hub_mark_read":
+        return collab.mark_read(agent_id, **cleaned_args)
+    elif tool_name == "hub_create_task":
+        return collab.create_task(agent_id, **cleaned_args)
+    elif tool_name == "hub_list_tasks":
+        return collab.list_tasks(agent_id, **cleaned_args)
+    elif tool_name == "hub_update_task":
+        return collab.update_task(agent_id, **cleaned_args)
     elif tool_name == "hub_issue_agent_token":
         return tool_issue_agent_token(caller_agent_id=agent_id, caller_role=role, **cleaned_args)
     elif tool_name == "hub_revoke_agent_token":
@@ -138,7 +174,7 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
                 },
                 "serverInfo": {
                     "name": "server-agents-gateway",
-                    "version": "2.0.0"
+                    "version": "2.1.0"
                 }
             }
         }
@@ -166,17 +202,17 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
             # Run in a thread so long shell commands don't stall other clients or keepalives
             result = await asyncio.to_thread(dispatch_tool, agent_id, role, tool_name, arguments)
             text_val = json.dumps(result, ensure_ascii=False) if not isinstance(result, str) else result
+            content = [{"type": "text", "text": text_val}]
+            # 未读提示放在独立的第二个 content 项里：content[0] 的 JSON 结构不变，
+            # 只解析第一项的客户端不受影响，把所有 text 拼给模型的客户端能看到它。
+            if tool_name not in collab.NO_HINT_TOOLS:
+                hint = await asyncio.to_thread(collab.unread_hint, agent_id)
+                if hint:
+                    content.append({"type": "text", "text": hint})
             return {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": text_val
-                        }
-                    ]
-                }
+                "result": {"content": content},
             }
         except Exception as e:
             return {
