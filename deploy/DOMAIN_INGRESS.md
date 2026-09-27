@@ -27,7 +27,7 @@ This guide describes how to bind your custom private or public domain to **Serve
 ┌────────────────────────────────────────────────────────┐
 │     Server Agents Gateway (server.py)                  │
 │     - Evaluates Per-Agent Bearer Tokens                │
-│     - Enforces Fencing Locks & Safety Sandboxes        │
+│     - Audit log + recycle bin (root, no sandbox)       │
 └────────────────────────────────────────────────────────┘
 ```
 

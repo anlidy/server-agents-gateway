@@ -21,6 +21,27 @@
 
 防出事靠审计和回收站，不靠命令白名单。
 
+## 权限与风险（请先读）
+
+网关以 **root** 运行，systemd 单元**不带任何沙箱**（没有 `ProtectSystem` / `ProtectHome` / `PrivateTmp`）：
+
+- `hub_shell` 和文件工具能改 `/etc`、`/usr`、`/root`，能装服务、改 systemd 单元；
+- `/tmp` 与宿主、SSH 会话是同一个。
+
+这是有意的：个人服务器上 agent 要真正干活，绕道 SSH 反而更不可控。保留的安全网：
+
+- **审计**：每次改机器的调用都写 SQLite（命令、stdout/stderr、diff），可回放；
+- **回收站**：`hub_delete_file`、覆盖写、`hub_patch_file`、shell 里的 `rm` 都先进回收站（`/bin/rm` 仍是真删）；
+- **脱敏**：token、Bearer 头、常见 API key 进审计前打码（`sag/audit_redact.py`）；
+- **自保**：文件工具和 `rm` 包装器不碰 `data/`（数据库、回收站）和 `.env`，避免误删审计本身。
+
+**风险：任何一个 token 泄露，等于这台服务器的 root 泄露。** 建议：
+
+1. 只给你信任、且确实需要改机器的 agent 签发 token，一端一个，不共用；
+2. 不用的 agent 立刻 `hub_revoke_agent_token`；
+3. 公网只经 Cloudflare Tunnel 暴露，不要在防火墙放行 4180；
+4. 定期用 `hub_query_audit_logs` 看一眼谁做了什么。
+
 ## 工具
 
 | 工具 | 作用 |

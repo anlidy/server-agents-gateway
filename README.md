@@ -21,6 +21,8 @@ Several agents (phone, desktop IDE, a cron job) share one Linux box. The gateway
 
 Safety is audit + trash, not a command allowlist.
 
+**No sandbox.** The gateway runs as root and the systemd unit sets no `ProtectSystem` / `ProtectHome` / `PrivateTmp`: `hub_shell` can write `/etc`, `/usr`, `/root`, manage systemd units, and shares `/tmp` with SSH sessions. What remains: full audit log, recycle bin, secret redaction in audit, and self-protection of `data/` and `.env`. **A leaked token is a leaked root shell** — only issue tokens to agents you trust, one per client, and revoke unused ones.
+
 ## Tools
 
 | Tool | Role |

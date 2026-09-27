@@ -13,10 +13,10 @@ RestartSec=5
 KillMode=mixed
 TimeoutStopSec=15
 
-# Security hardening options
-ProtectSystem=full
-ProtectHome=read-only
-PrivateTmp=true
+# 故意不加 ProtectSystem / ProtectHome / PrivateTmp 等沙箱选项：
+# hub_shell 需要真正的 root（能改 /etc、/usr、/root，装服务、改 systemd），
+# /tmp 也要和 SSH 会话共享。安全网是审计日志 + 回收站 + 审计脱敏，
+# 不是文件系统隔离。持有任意 token = 持有这台机器的 root，只给可信 agent 签发。
 
 [Install]
 WantedBy=multi-user.target

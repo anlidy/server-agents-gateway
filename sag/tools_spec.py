@@ -5,6 +5,8 @@ MCP_TOOLS_SPEC = [
         "name": "hub_shell",
         "description": (
             "Run a command with bash -lc (pipes and redirects work). "
+            "Runs as root on the host with no sandbox: /etc, /usr, /root and systemd are writable, "
+            "and /tmp is the same /tmp that SSH sessions see. Every call is audited. "
             "rm is bound to an absolute-path recycle-bin wrapper; /bin/rm still deletes for real. "
             "If you add, remove, or move a service, update the matching ### in SERVER_AGENTS.md "
             "Inventory (see ## Conventions for `- probe:` format) in the same turn."

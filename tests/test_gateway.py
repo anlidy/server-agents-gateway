@@ -482,6 +482,33 @@ who changes topology updates inventory
         self.assertIn("gateway_audit_logs_v1", tables)
         self.assertNotIn("gateway_audit_logs", tables)
 
+    def test_systemd_unit_has_no_sandbox(self):
+        unit = (_ROOT / "deploy" / "server-agents-gateway.service").read_text(encoding="utf-8")
+        active = [
+            line.strip()
+            for line in unit.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertIn("User=root", active)
+        for key in ("ProtectSystem", "ProtectHome", "PrivateTmp", "ReadOnlyPaths", "ReadWritePaths"):
+            self.assertFalse(
+                any(line.startswith(key + "=") for line in active),
+                msg=f"{key} should not be set: hub_shell is meant to be real root",
+            )
+
+    def test_file_tools_not_limited_to_gateway_root(self):
+        # 只有 db / .env / data/ 受自保，其余绝对路径都能写（沙箱已放开）。
+        outside = Path(tempfile.mkdtemp(prefix="sag_outside_"))
+        try:
+            target = outside / "etc-like" / "unit.conf"
+            self.assertFalse(is_protected(target))
+            tool_write_file("test:agent", str(target), "x=1\n", "write outside gateway root")
+            self.assertEqual(target.read_text(encoding="utf-8"), "x=1\n")
+            res = tool_delete_file("test:agent", str(target), "cleanup")
+            self.assertEqual(res["status"], "TRASHED")
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
     def test_replace_status_block_keeps_surrounding(self):
         text = f"# h\n\n{STATUS_START}\nold\n{STATUS_END}\n\n## Inventory\nkeep\n"
         out = replace_status_block(text, "new-status")
