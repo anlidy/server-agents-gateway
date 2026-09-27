@@ -11,12 +11,7 @@ from pathlib import Path
 def _load_env_file(filepath: Path) -> None:
     if not filepath.exists():
         return
-    try:
-        f = open(filepath, "r", encoding="utf-8")
-    except PermissionError:
-        # .env 是 root 600；非 root 进程（测试、operator）读不到，用环境变量和默认值即可
-        return
-    with f:
+    with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -72,14 +67,6 @@ class Config:
     audit_body_max_bytes: int = int(os.getenv("GATEWAY_AUDIT_BODY_MAX_BYTES", str(2 * 1024 * 1024)))
     trash_retention_days: int = int(os.getenv("GATEWAY_TRASH_RETENTION_DAYS", "30"))
     reconcile_interval_seconds: int = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
-    # 权限分级：非 admin agent 以这个普通 Unix 用户执行 shell 和文件操作。
-    operator_user: str = os.getenv("GATEWAY_OPERATOR_USER", "sag-operator")
-    operator_group: str = os.getenv("GATEWAY_OPERATOR_GROUP", "sag-operators")
-    # 留空 = 取该用户在 /etc/passwd 里的 home（测试时可覆盖）
-    operator_home: str = os.getenv("GATEWAY_OPERATOR_HOME", "")
-    operator_no_new_privs: bool = os.getenv("GATEWAY_OPERATOR_NO_NEW_PRIVS", "true").lower() in ("true", "1", "yes")
-    operator_trash_max_mb: int = int(os.getenv("GATEWAY_OPERATOR_TRASH_MAX_MB", "1024"))
-    elevation_ttl_hours: int = int(os.getenv("GATEWAY_ELEVATION_TTL_HOURS", "24"))
     # Kept so existing .env files still load; unused in v2.
     ai_provider_enabled: bool = os.getenv("AI_PROVIDER_ENABLED", "true").lower() in ("true", "1", "yes")
     ai_provider_base_url: str = os.getenv("AI_PROVIDER_BASE_URL", "http://127.0.0.1:8080/v1")

@@ -19,8 +19,6 @@ from .executor import CommandExecutionError, execute_shell
 from .overview import overview_path, read_overview, write_handwritten
 from .reconciler import collect_host_status, reconcile
 from .trash import ProtectedPathError, is_protected, list_trash, restore_trash, trash_put
-from . import privilege
-from .privilege import OperatorUnavailable, call_worker, decode_old, ingest_spool
 
 
 def _audit_then_raise(agent_id, tool_name, action_type, target, reason, status, exc, **kwargs):
@@ -37,13 +35,11 @@ def _audit_then_raise(agent_id, tool_name, action_type, target, reason, status, 
     raise exc
 
 
-def _extract_trash_ids(stderr: str, marker: str = "SAG_TRASH") -> tuple[str, List[str]]:
-    """admin shell 的 rm 包装器打 SAG_TRASH <trash_id>；operator 的打 SAG_TRASH_SPOOL <spool_id>。
-    只认当前模式对应的那一种，operator 伪造的另一种行原样留在 stderr 里。"""
+def _extract_trash_ids(stderr: str) -> tuple[str, List[str]]:
     ids: List[str] = []
     keep: List[str] = []
     for line in (stderr or "").splitlines(True):
-        if line.startswith(marker + " "):
+        if line.startswith("SAG_TRASH "):
             token = line.split()[1].strip() if len(line.split()) > 1 else ""
             if token:
                 ids.append(token)
@@ -58,16 +54,14 @@ def tool_shell(
     reason: str,
     cwd: Optional[str] = None,
     timeout_seconds: Optional[int] = None,
-    *,
-    privileged: bool = False,
 ) -> Dict[str, Any]:
     start = time.time()
     code, stdout, stderr, truncated = -1, "", "", False
     try:
         code, stdout, stderr, truncated = execute_shell(
-            command, cwd=cwd, timeout_seconds=timeout_seconds, agent_id=agent_id, privileged=privileged
+            command, cwd=cwd, timeout_seconds=timeout_seconds, agent_id=agent_id
         )
-    except (CommandExecutionError, OperatorUnavailable) as exc:
+    except CommandExecutionError as exc:
         append_audit(
             agent_id=agent_id,
             tool_name="hub_shell",
@@ -84,15 +78,10 @@ def tool_shell(
             reconcile()
         except Exception:
             pass
-    if privileged:
-        stderr, trash_ids = _extract_trash_ids(stderr)
-        workdir = cwd or config.shell_cwd
-    else:
-        stderr, spool_ids = _extract_trash_ids(stderr, "SAG_TRASH_SPOOL")
-        trash_ids = [t for t in (ingest_spool(sid, agent_id, "operator_rm") for sid in spool_ids) if t]
-        workdir = cwd or privilege.operator_identity().home
+    stderr, trash_ids = _extract_trash_ids(stderr)
     duration_ms = int((time.time() - start) * 1000)
     status = "SUCCESS" if code == 0 else "FAILED"
+    workdir = cwd or config.shell_cwd
     append_audit(
         agent_id=agent_id,
         tool_name="hub_shell",
@@ -108,7 +97,6 @@ def tool_shell(
             "cwd": workdir,
             "timeout_seconds": timeout_seconds,
             "trash_ids": trash_ids,
-            "run_as": "root" if privileged else config.operator_user,
         },
         trash_id=trash_ids[0] if trash_ids else None,
         stdout=stdout,
@@ -123,7 +111,6 @@ def tool_shell(
         "truncated": truncated,
         "duration_ms": duration_ms,
         "trash_ids": trash_ids,
-        "run_as": "root" if privileged else config.operator_user,
     }
 
 
@@ -132,16 +119,7 @@ def tool_read_file(
     path: str,
     offset: int = 1,
     limit: Optional[int] = None,
-    *,
-    privileged: bool = False,
 ) -> Dict[str, Any]:
-    if not privileged:
-        res = _op_call(agent_id, "hub_read_file", "file_read", path, "", "read",
-                       {"path": path, "offset": offset, "limit": limit})
-        append_audit(agent_id=agent_id, tool_name="hub_read_file", action_type="file_read",
-                     target=res["path"], reason="", status="SUCCESS", stdout=res["content"],
-                     params={"offset": offset, "limit": limit, "run_as": config.operator_user})
-        return res
     target = Path(path).resolve()
     if not target.exists():
         append_audit(
@@ -181,14 +159,7 @@ def tool_read_file(
     return {"path": str(target), "content": content}
 
 
-def tool_list_dir(agent_id: str, path: str, *, privileged: bool = False) -> Dict[str, Any]:
-    if not privileged:
-        res = _op_call(agent_id, "hub_list_dir", "dir_list", path, "", "list_dir", {"path": path})
-        append_audit(agent_id=agent_id, tool_name="hub_list_dir", action_type="dir_list",
-                     target=res["path"], reason="", status="SUCCESS",
-                     params={"count": len(res["entries"]), "truncated": res["truncated"],
-                             "run_as": config.operator_user})
-        return res
+def tool_list_dir(agent_id: str, path: str) -> Dict[str, Any]:
     target = Path(path).resolve()
     if not target.exists():
         append_audit(
@@ -239,13 +210,7 @@ def tool_list_dir(agent_id: str, path: str, *, privileged: bool = False) -> Dict
     return {"path": str(target), "entries": entries, "truncated": truncated}
 
 
-def tool_mkdir(agent_id: str, path: str, reason: str, *, privileged: bool = False) -> Dict[str, Any]:
-    if not privileged:
-        res = _op_call(agent_id, "hub_mkdir", "dir_create", path, reason, "mkdir", {"path": path})
-        append_audit(agent_id=agent_id, tool_name="hub_mkdir", action_type="dir_create",
-                     target=res["path"], reason=reason, status="SUCCESS",
-                     params={"existed": res["existed"], "run_as": config.operator_user})
-        return res
+def tool_mkdir(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
     target = Path(path).resolve()
     if is_protected(target):
         _audit_then_raise(
@@ -281,11 +246,7 @@ def tool_patch_file(
     new_string: str,
     reason: str,
     replace_all: bool = False,
-    *,
-    privileged: bool = False,
 ) -> Dict[str, Any]:
-    if not privileged and not _is_overview(path):
-        return _op_patch(agent_id, path, old_string, new_string, reason, replace_all)
     target = Path(path).resolve()
     if is_protected(target):
         _audit_then_raise(
@@ -366,9 +327,7 @@ def tool_patch_file(
     }
 
 
-def tool_write_file(agent_id: str, path: str, content: str, reason: str, *, privileged: bool = False) -> Dict[str, Any]:
-    if not privileged and not _is_overview(path):
-        return _op_write(agent_id, path, content, reason)
+def tool_write_file(agent_id: str, path: str, content: str, reason: str) -> Dict[str, Any]:
     target = Path(path).resolve()
     if is_protected(target):
         _audit_then_raise(
@@ -425,9 +384,7 @@ def tool_write_file(agent_id: str, path: str, content: str, reason: str, *, priv
     return {"path": str(target), "bytes_written": len(content.encode("utf-8")), "trash_id": trash_id}
 
 
-def tool_delete_file(agent_id: str, path: str, reason: str, *, privileged: bool = False) -> Dict[str, Any]:
-    if not privileged:
-        return _op_delete(agent_id, path, reason)
+def tool_delete_file(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
     target = Path(path).resolve()
     if is_protected(target):
         _audit_then_raise(
@@ -466,9 +423,8 @@ def tool_delete_file(agent_id: str, path: str, reason: str, *, privileged: bool 
     return {"path": str(target), "status": "TRASHED", "trash_id": trash_id}
 
 
-def tool_list_trash(agent_id: str, prefix: Optional[str] = None, limit: int = 50, *,
-                    privileged: bool = False) -> List[Dict[str, Any]]:
-    items = list_trash(prefix=prefix, limit=limit, operator_only=not privileged)
+def tool_list_trash(agent_id: str, prefix: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    items = list_trash(prefix=prefix, limit=limit)
     append_audit(
         agent_id=agent_id,
         tool_name="hub_list_trash",
@@ -481,8 +437,8 @@ def tool_list_trash(agent_id: str, prefix: Optional[str] = None, limit: int = 50
     return items
 
 
-def tool_restore_file(agent_id: str, trash_id: str, reason: str, *, privileged: bool = False) -> Dict[str, Any]:
-    result = restore_trash(trash_id, as_operator=not privileged, agent_id=agent_id)
+def tool_restore_file(agent_id: str, trash_id: str, reason: str) -> Dict[str, Any]:
+    result = restore_trash(trash_id)
     status = "SUCCESS" if result.get("status") == "RESTORED" else "FAILED"
     append_audit(
         agent_id=agent_id,
@@ -525,18 +481,13 @@ def tool_get_status() -> Dict[str, Any]:
     return collect_host_status()
 
 
-def tool_query_audit_logs(caller: str = "", *, privileged: bool = False, **kwargs) -> List[Dict[str, Any]]:
-    if not privileged:
-        # operator 只能看自己的审计记录
-        kwargs["agent_id"] = caller
-    return query_audit_logs(**kwargs)
+def tool_query_audit_logs(**kwargs) -> List[Dict[str, Any]]:
+    rows = query_audit_logs(**kwargs)
+    return rows
 
 
-def tool_get_audit_event(event_id: str, caller: str = "", *, privileged: bool = False) -> Dict[str, Any]:
-    event = get_audit_event(event_id)
-    if not privileged and event.get("agent_id") != caller:
-        raise ValueError(f"Audit event not found: {event_id}")
-    return event
+def tool_get_audit_event(event_id: str) -> Dict[str, Any]:
+    return get_audit_event(event_id)
 
 
 def tool_issue_agent_token(caller_agent_id: str, caller_role: str, agent_id: str) -> Dict[str, Any]:
@@ -586,117 +537,3 @@ def tool_revoke_agent_token(caller_agent_id: str, caller_role: str, agent_id: st
         params={"target_agent_id": agent_id},
     )
     return {"agent_id": agent_id, "status": "REVOKED" if success else "NOT_FOUND"}
-
-
-# ---------------------------------------------------------------------------
-# operator 实现：文件操作全部交给以 operator 身份运行的 opworker 子进程，
-# 能不能做由内核判定。唯一的例外是 SERVER_AGENTS.md（约定要求改拓扑时同步更新），
-# 那一个文件由 root 代写并记审计。
-# ---------------------------------------------------------------------------
-
-
-def _is_overview(path: str) -> bool:
-    try:
-        return Path(path).resolve() == overview_path().resolve()
-    except OSError:
-        return False
-
-
-_ELEVATION_HINT = (
-    " (runs as unprivileged user {user}; if this needs root, submit hub_request_elevation "
-    "instead of working around it)"
-)
-
-
-def _op_call(agent_id, tool_name, action_type, path, reason, op, req):
-    try:
-        return call_worker(op, req, agent_id=agent_id)
-    except PermissionError as exc:
-        wrapped = PermissionError(str(exc) + _ELEVATION_HINT.format(user=config.operator_user))
-        _audit_then_raise(agent_id, tool_name, action_type, path, reason, "REJECTED", wrapped,
-                          params={"run_as": config.operator_user})
-    except Exception as exc:
-        _audit_then_raise(agent_id, tool_name, action_type, path, reason, "FAILED", exc,
-                          params={"run_as": config.operator_user})
-
-
-def _trash_old_bytes(agent_id: str, original_path: str, data: bytes, source: str) -> str:
-    """operator 覆盖掉的旧内容，以 tar 形式进回收站（这样只能以 operator 身份还原）。"""
-    import io
-    import tarfile
-
-    from .trash import store_tar_payload
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tf:
-        info = tarfile.TarInfo("payload")
-        info.size = len(data)
-        info.mode = 0o644
-        info.mtime = int(time.time())
-        tf.addfile(info, io.BytesIO(data))
-    buf.seek(0)
-    return store_tar_payload(buf, original_path=original_path, is_dir=False, size_bytes=len(data),
-                             agent_id=agent_id, source=source)
-
-
-def _diff(old: str, new: str, name: str) -> str:
-    return "\n".join(
-        difflib.unified_diff(old.splitlines(), new.splitlines(), fromfile=f"a/{name}",
-                             tofile=f"b/{name}", lineterm="")
-    )
-
-
-def _op_write(agent_id: str, path: str, content: str, reason: str) -> Dict[str, Any]:
-    res = _op_call(agent_id, "hub_write_file", "file_write", path, reason, "write",
-                   {"path": path, "content": content})
-    old = decode_old(res)
-    trash_id = _trash_old_bytes(agent_id, res["path"], old, "operator_write") if old is not None else None
-    old_text = old.decode("utf-8", errors="replace") if old is not None else ""
-    append_audit(agent_id=agent_id, tool_name="hub_write_file", action_type="file_write",
-                 target=res["path"], reason=reason, status="SUCCESS", trash_id=trash_id,
-                 diff=_diff(old_text, content, Path(res["path"]).name),
-                 params={"created": not res["existed"], "run_as": config.operator_user})
-    return {"path": res["path"], "bytes_written": res["bytes_written"], "trash_id": trash_id}
-
-
-def _op_patch(agent_id, path, old_string, new_string, reason, replace_all) -> Dict[str, Any]:
-    res = _op_call(agent_id, "hub_patch_file", "file_patch", path, reason, "patch",
-                   {"path": path, "old_string": old_string, "new_string": new_string,
-                    "replace_all": bool(replace_all)})
-    trash_id = _trash_old_bytes(agent_id, res["path"], res["old"].encode("utf-8"), "operator_patch")
-    append_audit(agent_id=agent_id, tool_name="hub_patch_file", action_type="file_patch",
-                 target=res["path"], reason=reason, status="SUCCESS", trash_id=trash_id,
-                 diff=_diff(res["old"], res["new"], Path(res["path"]).name),
-                 params={"replacements": res["replacements"], "replace_all": bool(replace_all),
-                         "run_as": config.operator_user})
-    return {"path": res["path"], "replacements": res["replacements"], "trash_id": trash_id}
-
-
-def _op_delete(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
-    ident = privilege.operator_identity()
-    try:
-        res = call_worker("trash", {"path": path, "spool": ident.spool_dir,
-                                    "max_bytes": config.operator_trash_max_mb * 1024 * 1024,
-                                    "agent": agent_id}, agent_id=agent_id)
-    except FileNotFoundError:
-        append_audit(agent_id=agent_id, tool_name="hub_delete_file", action_type="file_delete",
-                     target=str(path), reason=reason, status="FAILED",
-                     params={"run_as": config.operator_user})
-        return {"path": str(path), "status": "NOT_FOUND"}
-    except PermissionError as exc:
-        wrapped = PermissionError(str(exc) + _ELEVATION_HINT.format(user=config.operator_user))
-        _audit_then_raise(agent_id, "hub_delete_file", "file_delete", path, reason, "REJECTED", wrapped,
-                          params={"run_as": config.operator_user})
-    except Exception as exc:
-        _audit_then_raise(agent_id, "hub_delete_file", "file_delete", path, reason, "FAILED", exc,
-                          params={"run_as": config.operator_user})
-    trash_id = ingest_spool(res["spool_id"], agent_id, "operator_delete", ident)
-    status = "TRASHED" if not res.get("partial") else "PARTIAL"
-    append_audit(agent_id=agent_id, tool_name="hub_delete_file", action_type="file_delete",
-                 target=res["original_path"], reason=reason,
-                 status="SUCCESS" if status == "TRASHED" else "FAILED", trash_id=trash_id,
-                 params={"run_as": config.operator_user, "partial": res.get("partial")})
-    out = {"path": res["original_path"], "status": status, "trash_id": trash_id}
-    if res.get("partial"):
-        out["error"] = res["partial"]
-    return out

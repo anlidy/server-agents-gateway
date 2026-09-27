@@ -39,27 +39,21 @@ from .tools import (
     tool_write_file,
 )
 
-from .tools_spec import ADMIN_ONLY_TOOL_NAMES, ADMIN_ROLE_TOOL_NAMES, tools_for
-from . import elevation, grants
-from .privilege import is_privileged
-
+from .tools_spec import MCP_TOOLS_SPEC, ADMIN_ONLY_TOOL_NAMES
 
 def get_tools_for_agent(agent_id: str, role: str) -> list:
     """
-    按角色给工具列表：
-    - root admin（config.root_admin_agent_id 且 role=admin）：全部，包括签发/吊销 token；
-    - 其他 admin：除签发/吊销 token 之外的全部（含提权审批、目录授权）；
-    - operator：普通用户权限的工具，说明里写清限制和 hub_request_elevation。
+    Role-based Tool Visibility:
+    Only the configured root admin agent can see and access credential issuance tools.
+    All other agents see operational tools without token issuance.
     """
-    privileged = is_privileged(role)
-    is_root_admin = agent_id == config.root_admin_agent_id and role == "admin"
-    return tools_for(privileged=privileged, root_admin=is_root_admin)
+    if agent_id == config.root_admin_agent_id and role == "admin":
+        return MCP_TOOLS_SPEC
+    return [t for t in MCP_TOOLS_SPEC if t["name"] not in ADMIN_ONLY_TOOL_NAMES]
 
 
 _SPOOF_KEYS = ("from", "from_agent", "sender", "created_by", "agent_id")
 _SENDER_TOOLS = {"hub_send_message", "hub_reply", "hub_create_task", "hub_update_task", "hub_set_group"}
-# 这些参数名由网关自己决定，客户端传进来一律拒绝（防止自称 privileged）
-_RESERVED_KEYS = ("privileged", "caller", "role", "approver", "caller_agent_id", "caller_role")
 
 
 def _reject_spoofing(tool_name: str, args: Dict[str, Any]) -> None:
@@ -75,36 +69,30 @@ def dispatch_tool(agent_id: str, role: str, tool_name: str, arguments: Dict[str,
     if tool_name in ADMIN_ONLY_TOOL_NAMES:
         if agent_id != config.root_admin_agent_id or role != "admin":
             raise ValueError(f"Unknown MCP tool: {tool_name}")
-    priv = is_privileged(role)
-    if tool_name in ADMIN_ROLE_TOOL_NAMES and not priv:
-        raise ValueError(f"Unknown MCP tool: {tool_name}")
 
     # Filter out client-side synthetic kwargs (e.g. Operit internal metadata)
     cleaned_args = {k: v for k, v in (arguments or {}).items() if not k.startswith("__")}
-    reserved = [k for k in _RESERVED_KEYS if k in cleaned_args]
-    if reserved:
-        raise ValueError(f"{tool_name}: '{reserved[0]}' is decided by the gateway from your token, not by arguments")
     if tool_name in _SENDER_TOOLS:
         _reject_spoofing(tool_name, cleaned_args)
 
     if tool_name == "hub_shell":
-        return tool_shell(agent_id, **cleaned_args, privileged=priv)
+        return tool_shell(agent_id, **cleaned_args)
     elif tool_name == "hub_read_file":
-        return tool_read_file(agent_id, **cleaned_args, privileged=priv)
+        return tool_read_file(agent_id, **cleaned_args)
     elif tool_name == "hub_list_dir":
-        return tool_list_dir(agent_id, **cleaned_args, privileged=priv)
+        return tool_list_dir(agent_id, **cleaned_args)
     elif tool_name == "hub_mkdir":
-        return tool_mkdir(agent_id, **cleaned_args, privileged=priv)
+        return tool_mkdir(agent_id, **cleaned_args)
     elif tool_name == "hub_write_file":
-        return tool_write_file(agent_id, **cleaned_args, privileged=priv)
+        return tool_write_file(agent_id, **cleaned_args)
     elif tool_name == "hub_patch_file":
-        return tool_patch_file(agent_id, **cleaned_args, privileged=priv)
+        return tool_patch_file(agent_id, **cleaned_args)
     elif tool_name == "hub_delete_file":
-        return tool_delete_file(agent_id, **cleaned_args, privileged=priv)
+        return tool_delete_file(agent_id, **cleaned_args)
     elif tool_name == "hub_list_trash":
-        return tool_list_trash(agent_id, **cleaned_args, privileged=priv)
+        return tool_list_trash(agent_id, **cleaned_args)
     elif tool_name == "hub_restore_file":
-        return tool_restore_file(agent_id, **cleaned_args, privileged=priv)
+        return tool_restore_file(agent_id, **cleaned_args)
     elif tool_name == "hub_get_overview":
         return tool_get_overview()
     elif tool_name == "hub_rebuild_overview":
@@ -112,23 +100,9 @@ def dispatch_tool(agent_id: str, role: str, tool_name: str, arguments: Dict[str,
     elif tool_name == "hub_get_status":
         return tool_get_status()
     elif tool_name == "hub_query_audit_logs":
-        return tool_query_audit_logs(agent_id, privileged=priv, **cleaned_args)
+        return tool_query_audit_logs(**cleaned_args)
     elif tool_name == "hub_get_audit_event":
-        return tool_get_audit_event(cleaned_args.get("id") or cleaned_args.get("event_id"), agent_id, privileged=priv)
-    elif tool_name == "hub_request_elevation":
-        return elevation.request_elevation(agent_id, priv, **cleaned_args)
-    elif tool_name == "hub_list_elevations":
-        return elevation.list_elevations(agent_id, priv, **cleaned_args)
-    elif tool_name == "hub_approve_elevation":
-        return elevation.approve_elevation(agent_id, priv, **cleaned_args)
-    elif tool_name == "hub_reject_elevation":
-        return elevation.reject_elevation(agent_id, priv, **cleaned_args)
-    elif tool_name == "hub_grant_path":
-        return grants.grant_path(agent_id, priv, **cleaned_args)
-    elif tool_name == "hub_revoke_grant":
-        return grants.revoke_grant(agent_id, priv, **cleaned_args)
-    elif tool_name == "hub_list_grants":
-        return grants.list_grants()
+        return tool_get_audit_event(cleaned_args.get("id") or cleaned_args.get("event_id"))
     elif tool_name == "hub_list_agents":
         return collab.list_agents(agent_id, **cleaned_args)
     elif tool_name == "hub_set_group":
@@ -200,7 +174,7 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
                 },
                 "serverInfo": {
                     "name": "server-agents-gateway",
-                    "version": "2.2.0"
+                    "version": "2.1.0"
                 }
             }
         }
@@ -501,18 +475,6 @@ async def _periodic_reconcile_loop():
             await asyncio.to_thread(reconcile)
         except Exception as exc:
             print(f"[reconcile] periodic pass failed: {exc}")
-        for name, fn in (("elevation expiry", elevation.expire_elevations),
-                         ("orphan spool", _ingest_orphans)):
-            try:
-                await asyncio.to_thread(fn)
-            except Exception as exc:
-                print(f"[{name}] periodic pass failed: {exc}")
-
-
-def _ingest_orphans() -> int:
-    from .privilege import ingest_orphan_spool
-
-    return ingest_orphan_spool()
 
 
 async def run_server():
@@ -531,10 +493,6 @@ async def run_server():
 
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] in ("elevation", "grant"):
-        from .cli import run_cli
-
-        sys.exit(run_cli(sys.argv[1:]))
     if len(sys.argv) > 1 and sys.argv[1] in ("issue-admin", "issue-root-admin"):
         init_db()
         admin_agent = sys.argv[2] if len(sys.argv) > 2 else config.root_admin_agent_id

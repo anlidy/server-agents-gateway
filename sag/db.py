@@ -149,39 +149,6 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_task_status ON agent_tasks(status, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_task_assignee ON agent_tasks(assignee, status);
-
-        -- 提权审批：operator 提交需要 root 的操作，admin 批准后 SAG 以 root 原样执行。
-        -- status: pending / rejected / expired / executed / failed
-        CREATE TABLE IF NOT EXISTS elevation_requests (
-            id TEXT PRIMARY KEY,
-            agent_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            payload_sha256 TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            created_ts REAL NOT NULL,
-            expires_at TEXT NOT NULL,
-            expires_ts REAL NOT NULL,
-            decided_by TEXT,
-            decided_at TEXT,
-            decision_note TEXT,
-            result_json TEXT,
-            exit_code INTEGER,
-            thread_id TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_elev_status ON elevation_requests(status, created_ts DESC);
-        CREATE INDEX IF NOT EXISTS idx_elev_agent ON elevation_requests(agent_id, created_ts DESC);
-
-        -- admin 授权给 operator 组可写（或只读）的目录，实际权限落在 POSIX ACL 上
-        CREATE TABLE IF NOT EXISTS operator_grants (
-            path TEXT PRIMARY KEY,
-            access TEXT NOT NULL,
-            granted_by TEXT NOT NULL,
-            granted_at TEXT NOT NULL,
-            reason TEXT NOT NULL DEFAULT ''
-        );
         """
         )
         conn.commit()
