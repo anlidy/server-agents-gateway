@@ -398,6 +398,65 @@ who changes topology updates inventory
         text = tool_get_overview()
         self.assertIn("from-disk", text)
 
+    def test_get_overview_section(self):
+        ensure_document()
+        Path(config.overview_path).write_text(
+            "# h\n\n<!-- sag-status:start -->\n| up |\n<!-- sag-status:end -->\n"
+            "## Host\nhost-body\n\n## Inventory\n\n### sag\nsag-body\n\n### xmem\nxmem-body\n\n"
+            "## Conventions\nconv-body\n",
+            encoding="utf-8",
+        )
+        toc = tool_get_overview(section="toc")
+        self.assertIn("| up |", toc)
+        self.assertIn("### sag", toc)
+        self.assertNotIn("sag-body", toc)
+        part = tool_get_overview(section="SAG, conventions")
+        self.assertIn("sag-body", part)
+        self.assertIn("conv-body", part)
+        self.assertNotIn("xmem-body", part)
+        self.assertNotIn("host-body", part)
+        inv = tool_get_overview(section="Inventory")
+        self.assertIn("xmem-body", inv)
+        self.assertNotIn("conv-body", inv)
+        with self.assertRaisesRegex(ValueError, "Available"):
+            tool_get_overview(section="nope")
+
+    def test_shell_result_does_not_echo_command(self):
+        res = tool_shell("test:agent", "echo hi", "t")
+        self.assertNotIn("command", res)
+        self.assertEqual(res["stdout"].strip(), "hi")
+
+    def test_delete_many_paths(self):
+        cwd = Path(config.shell_cwd)
+        a, b = cwd / "a.log", cwd / "b.log"
+        a.write_text("a")
+        b.write_text("b")
+        res = tool_delete_file("test:agent", paths=[str(a), str(b), str(cwd / "missing")], reason="cleanup")
+        self.assertEqual([r["status"] for r in res], ["TRASHED", "TRASHED", "NOT_FOUND"])
+        self.assertFalse(a.exists() or b.exists())
+        rows = query_audit_logs(tool_name="hub_delete_file", limit=10)
+        self.assertEqual(len(rows), 3)
+        with self.assertRaises(ValueError):
+            tool_delete_file("test:agent", reason="x")
+        c = cwd / "c.log"
+        c.write_text("c")
+        res = tool_delete_file("test:agent", paths=[config.db_path, str(c)], reason="mixed")
+        self.assertEqual([r["status"] for r in res], ["REJECTED", "TRASHED"])
+        self.assertTrue(Path(config.db_path).exists())
+
+    def test_query_audit_logs_compact(self):
+        tool_shell("test:agent", "echo compact", "t")
+        row = tool_query_audit_logs(agent_id="test:agent", limit=1)[0]
+        self.assertEqual(row["target"], "echo compact")
+        self.assertEqual(row["exit_code"], 0)
+        for k in ("created_at", "params_json", "trash_id", "params"):
+            self.assertNotIn(k, row)
+        long_cmd = "echo " + "x" * 300
+        tool_shell("test:agent", long_cmd, "t")
+        row = tool_query_audit_logs(target="echo xxx*", limit=1)[0]
+        self.assertEqual(row["params"]["command"], long_cmd)
+        self.assertIn("params_json", tool_get_audit_event(row["id"]))
+
     def test_parse_probes_and_untracked(self):
         inventory = """
 ## Inventory
@@ -808,6 +867,56 @@ class TestCollab(unittest.TestCase):
         ):
             self.assertIn(n, names)
         self.assertNotIn("hub_issue_agent_token", names)
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.buf = b""
+
+    def write(self, data):
+        self.buf += data
+
+    async def drain(self):
+        pass
+
+
+class TestStreamableSession(unittest.TestCase):
+    def setUp(self):
+        _wipe_db()
+        init_db()
+
+    def _post(self, body, session=None):
+        import asyncio
+        from sag.server import handle_streamable_post
+
+        headers = {"accept": "application/json"}
+        if session:
+            headers["mcp-session-id"] = session
+        w = _FakeWriter()
+        asyncio.run(handle_streamable_post("wsl:pi", "operator", headers, json.dumps(body).encode(), w))
+        head, _, payload = w.buf.partition(b"\r\n\r\n")
+        return head.decode(), payload
+
+    def test_initialize_issues_session_for_this_boot(self):
+        from sag.server import BOOT_ID
+
+        head, _ = self._post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        self.assertIn(f"Mcp-Session-Id: {BOOT_ID}.", head)
+        sid = head.split("Mcp-Session-Id: ", 1)[1].split("\r\n", 1)[0]
+        head, _ = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session=sid)
+        self.assertTrue(head.startswith("HTTP/1.1 200"))
+        self.assertNotIn("Mcp-Session-Id", head)
+
+    def test_stale_session_gets_404(self):
+        head, payload = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session="0ld.boot")
+        self.assertTrue(head.startswith("HTTP/1.1 404"))
+        self.assertIn(b"re-initialize", payload)
+        head, _ = self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session="0ld.boot")
+        self.assertTrue(head.startswith("HTTP/1.1 404"))
+
+    def test_no_session_header_still_allowed(self):
+        head, _ = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        self.assertTrue(head.startswith("HTTP/1.1 200"))
 
 
 if __name__ == "__main__":

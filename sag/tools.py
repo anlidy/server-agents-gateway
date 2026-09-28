@@ -5,6 +5,7 @@ v2 MCP tool implementations.
 from __future__ import annotations
 
 import difflib
+import json
 import stat
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from .auth import issue_agent_token, revoke_agent_token
 from .config import config
 from .db import append_audit, get_audit_event, query_audit_logs
 from .executor import CommandExecutionError, execute_shell
-from .overview import overview_path, read_overview, write_handwritten
+from .overview import overview_path, read_overview, select_sections, write_handwritten
 from .reconciler import collect_host_status, reconcile
 from .trash import ProtectedPathError, is_protected, list_trash, restore_trash, trash_put
 
@@ -103,7 +104,6 @@ def tool_shell(
         stderr=stderr,
     )
     return {
-        "command": command,
         "cwd": workdir,
         "exit_code": code,
         "stdout": stdout,
@@ -384,7 +384,24 @@ def tool_write_file(agent_id: str, path: str, content: str, reason: str) -> Dict
     return {"path": str(target), "bytes_written": len(content.encode("utf-8")), "trash_id": trash_id}
 
 
-def tool_delete_file(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
+def tool_delete_file(
+    agent_id: str, path: Optional[str] = None, reason: str = "", paths: Optional[List[str]] = None
+) -> Any:
+    """One path returns one result; `paths` returns a list, each path audited on its own."""
+    if paths:
+        results = []
+        for p in ([path] if path else []) + list(paths):
+            try:
+                results.append(_delete_one(agent_id, p, reason))
+            except (ProtectedPathError, OSError) as exc:
+                results.append({"path": p, "status": "REJECTED", "error": str(exc)})
+        return results
+    if not path:
+        raise ValueError("path or paths is required")
+    return _delete_one(agent_id, path, reason)
+
+
+def _delete_one(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
     target = Path(path).resolve()
     if is_protected(target):
         _audit_then_raise(
@@ -457,11 +474,12 @@ def tool_restore_file(agent_id: str, trash_id: str, reason: str) -> Dict[str, An
     return result
 
 
-def tool_get_overview() -> str:
+def tool_get_overview(section: Optional[str] = None) -> str:
     from .overview import ensure_document
 
     ensure_document()
-    return read_overview()
+    text = read_overview()
+    return select_sections(text, section) if section and section.strip() else text
 
 
 def tool_rebuild_overview(reason: str = "refresh status") -> str:
@@ -481,9 +499,37 @@ def tool_get_status() -> Dict[str, Any]:
     return collect_host_status()
 
 
+def _compact_audit_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    List view only: drop created_at (UTC copy of timestamp), empty fields, and
+    params_json keys that just repeat a column (shell command == target, cwd, ...).
+    hub_get_audit_event still returns the full row.
+    """
+    out = {}
+    for k, v in row.items():
+        if k in ("created_at", "params_json"):
+            continue
+        if v is None or v == "" or (v == 0 and k != "exit_code"):
+            continue
+        out[k] = v
+    try:
+        params = json.loads(row.get("params_json") or "{}")
+    except ValueError:
+        params = {"raw": row.get("params_json")}
+    if isinstance(params, dict):
+        params = {
+            k: v for k, v in params.items()
+            if v not in (None, "", [], {})
+            and not (k == "command" and v == row.get("target"))
+            and not (k in row and row[k] == v)
+        }
+    if params:
+        out["params"] = params
+    return out
+
+
 def tool_query_audit_logs(**kwargs) -> List[Dict[str, Any]]:
-    rows = query_audit_logs(**kwargs)
-    return rows
+    return [_compact_audit_row(r) for r in query_audit_logs(**kwargs)]
 
 
 def tool_get_audit_event(event_id: str) -> Dict[str, Any]:

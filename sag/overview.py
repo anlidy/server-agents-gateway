@@ -74,6 +74,56 @@ def strip_status_block(text: str) -> str:
     return before.rstrip() + "\n\n" + after.lstrip()
 
 
+_ANY_HEADING = re.compile(r"^(#{2,3})\s+(.+?)\s*$")
+
+
+def _headings(text: str) -> List[Tuple[int, int, str]]:
+    """(line index, level, title) of every ## / ### heading outside ``` fences."""
+    out, fenced = [], False
+    for i, line in enumerate(text.splitlines()):
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        m = None if fenced else _ANY_HEADING.match(line)
+        if m:
+            out.append((i, len(m.group(1)), m.group(2)))
+    return out
+
+
+def select_sections(text: str, section: str) -> str:
+    """
+    section="toc": status fence + heading list.
+    Otherwise comma-separated heading titles (case-insensitive, without #),
+    each returned with its body up to the next heading of the same or higher level.
+    """
+    heads = _headings(text)
+    if section.strip().lower() == "toc":
+        fence = ""
+        if STATUS_START in text and STATUS_END in text:
+            fence = STATUS_START + text.split(STATUS_START, 1)[1].split(STATUS_END, 1)[0] + STATUS_END + "\n\n"
+        toc = "\n".join(("  " if lvl == 3 else "") + ("#" * lvl) + " " + title for _, lvl, title in heads)
+        return fence + toc + "\n"
+
+    lines = text.splitlines(True)
+    by_title = {title.lower(): (idx, lvl) for idx, lvl, title in heads}
+    parts, missing = [], []
+    for name in (s.strip() for s in section.split(",")):
+        if not name:
+            continue
+        hit = by_title.get(name.lower())
+        if not hit:
+            missing.append(name)
+            continue
+        idx, lvl = hit
+        end = next((j for j, l, _ in heads if j > idx and l <= lvl), len(lines))
+        parts.append("".join(lines[idx:end]).rstrip() + "\n")
+    if missing:
+        raise ValueError(
+            f"Section not found: {', '.join(missing)}. Available: {', '.join(t for _, _, t in heads)}"
+        )
+    return "\n".join(parts)
+
+
 def replace_status_block(text: str, status_inner: str) -> str:
     inner = status_inner.strip() + "\n"
     block = f"{STATUS_START}\n{inner}{STATUS_END}"

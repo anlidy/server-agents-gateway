@@ -96,16 +96,18 @@ MCP_TOOLS_SPEC = [
     {
         "name": "hub_delete_file",
         "description": (
-            "Move a file or directory to the recycle bin (30-day retention). "
+            "Move files or directories to the recycle bin (30-day retention). "
+            "Give `path` for one, or `paths` for several (each gets its own audit entry and trash_id). "
             "If this removes a service or project, update SERVER_AGENTS.md Inventory."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
+                "paths": {"type": "array", "items": {"type": "string"}},
                 "reason": {"type": "string"},
             },
-            "required": ["path", "reason"],
+            "required": ["reason"],
         },
     },
     {
@@ -137,9 +139,21 @@ MCP_TOOLS_SPEC = [
             "Read SERVER_AGENTS.md from disk (no cache). Start work by reading this. "
             "Top sag-status fence is generated (do not edit). "
             "Inventory ### sections: add `- probe: systemd|docker|http|tcp ...` to show up/down. "
-            "Full format is in ## Conventions in the same file."
+            "Full format is in ## Conventions in the same file. "
+            "Read the whole file once per session; after that use `section` to re-read parts."
         ),
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "description": (
+                        "Optional. `toc` = status table + heading list. Otherwise comma-separated "
+                        "## / ### titles (e.g. `sag,Conventions`), each returned with its body."
+                    ),
+                },
+            },
+        },
     },
     {
         "name": "hub_rebuild_overview",
@@ -153,7 +167,10 @@ MCP_TOOLS_SPEC = [
     },
     {
         "name": "hub_query_audit_logs",
-        "description": "List audit events (no stdout/stderr bodies). Use hub_get_audit_event for full output.",
+        "description": (
+            "List audit events, compacted: no stdout/stderr bodies, empty fields dropped, "
+            "params only where they add to target. Use hub_get_audit_event for the full row and output."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {

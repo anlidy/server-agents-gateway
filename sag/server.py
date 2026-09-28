@@ -94,7 +94,7 @@ def dispatch_tool(agent_id: str, role: str, tool_name: str, arguments: Dict[str,
     elif tool_name == "hub_restore_file":
         return tool_restore_file(agent_id, **cleaned_args)
     elif tool_name == "hub_get_overview":
-        return tool_get_overview()
+        return tool_get_overview(**cleaned_args)
     elif tool_name == "hub_rebuild_overview":
         return tool_rebuild_overview(**cleaned_args)
     elif tool_name == "hub_get_status":
@@ -155,6 +155,20 @@ _SESSIONS: Dict[str, SSESession] = {}
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 KEEPALIVE_SECONDS = 15
 
+# 每次启动换一个 boot id，发给 /mcp 客户端的 Mcp-Session-Id 都以它开头。
+# 工具列表只在发版重启时变化；重启后旧会话的请求一律回 404，按 MCP 规范
+# 客户端必须重新 initialize，也就会重新 tools/list，拿到新工具。
+# 服务端不保存会话，只认前缀；不带会话头的请求（sag-call 等）照旧放行。
+BOOT_ID = uuid.uuid4().hex[:12]
+
+
+def _new_session_id() -> str:
+    return f"{BOOT_ID}.{uuid.uuid4().hex}"
+
+
+def _session_is_stale(session_id: str) -> bool:
+    return bool(session_id) and not session_id.startswith(BOOT_ID + ".")
+
 
 async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rpc_id = rpc_req.get("id")
@@ -174,7 +188,7 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
                 },
                 "serverInfo": {
                     "name": "server-agents-gateway",
-                    "version": "2.1.0"
+                    "version": "2.1.1"
                 }
             }
         }
@@ -248,10 +262,16 @@ async def handle_streamable_post(
     agent_id: str, role: str, headers: Dict[str, str], body_data: bytes, writer: asyncio.StreamWriter
 ) -> None:
     """
-    MCP Streamable HTTP, stateless mode (no Mcp-Session-Id).
+    MCP Streamable HTTP. Sessions carry no server state; Mcp-Session-Id only
+    marks which boot issued them (see BOOT_ID).
     Notifications/responses only -> 202. Requests -> one SSE stream when the client
     accepts it (with keepalive pings while tools run), otherwise a plain JSON body.
     """
+    if _session_is_stale(headers.get("mcp-session-id", "")):
+        err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": "Session expired (gateway restarted); re-initialize"}}
+        _write_simple(writer, "404 Not Found", json.dumps(err).encode())
+        return
+
     try:
         payload = json.loads(body_data.decode("utf-8"))
     except Exception:
@@ -278,10 +298,14 @@ async def handle_streamable_post(
         results = await asyncio.gather(*(handle_jsonrpc(agent_id, role, m) for m in messages))
         return [r for r in results if r]
 
+    session_header = b""
+    if any(m.get("method") == "initialize" for m in messages):
+        session_header = f"Mcp-Session-Id: {_new_session_id()}\r\n".encode()
+
     if "text/event-stream" not in headers.get("accept", ""):
         responses = await run_all()
         out = responses if is_batch else (responses[0] if responses else {})
-        _write_simple(writer, "200 OK", json.dumps(out, ensure_ascii=False).encode("utf-8"))
+        _write_simple(writer, "200 OK", json.dumps(out, ensure_ascii=False).encode("utf-8"), session_header)
         return
 
     writer.write(
@@ -289,6 +313,7 @@ async def handle_streamable_post(
         b"Content-Type: text/event-stream; charset=utf-8\r\n"
         b"Cache-Control: no-cache\r\n"
         b"X-Accel-Buffering: no\r\n"
+        + session_header +
         b"Connection: close\r\n"
         b"\r\n"
     )
