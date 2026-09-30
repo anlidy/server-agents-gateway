@@ -222,7 +222,7 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
                 },
                 "serverInfo": {
                     "name": "server-agents-gateway",
-                    "version": "2.1.2"
+                    "version": "2.1.3"
                 }
             }
         }

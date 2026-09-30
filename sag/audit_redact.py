@@ -14,7 +14,9 @@ _REDACTION_RULES: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)(bearer\s+)\S+"), r"\1***"),
     (re.compile(r"(?i)(cf-access-client-secret\s*:\s*)\S+"), r"\1***"),
     (re.compile(r"(?i)(cf-access-client-id\s*:\s*)\S+"), r"\1***"),
-    (re.compile(r"\bsag_[A-Za-z0-9_]+\b"), "***TOKEN***"),
+    # SAG token: sag_<agent_id with ':' -> '_'>_<48 hex>. Require a hex tail (16+ so a
+    # truncated token still counts) so names like /tmp/sag_patches stay readable.
+    (re.compile(r"\bsag_[A-Za-z0-9_.\-]*?_[0-9a-f]{16,}\b"), "***TOKEN***"),
     (re.compile(r"\bcfast_[A-Za-z0-9]+\b"), "***SECRET***"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]+\b"), "***PAT***"),
     (re.compile(r"\bsk-[A-Za-z0-9]{10,}\b"), "***API_KEY***"),

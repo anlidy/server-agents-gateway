@@ -8,7 +8,7 @@ A personal-server hub for multiple AI agents. MCP over Streamable HTTP (`/mcp`; 
 
 **English** | [简体中文](README_zh.md)
 
-Version **2.1.2**. Design notes: [docs/v2.md](docs/v2.md).
+Version **2.1.3**. Design notes: [docs/v2.md](docs/v2.md).
 
 ## What it does
 

@@ -392,19 +392,33 @@ class TestGatewayV2(unittest.TestCase):
         self.assertEqual((d / "n.txt").read_text(encoding="utf-8"), "nested")
 
     def test_audit_redaction_in_shell_log(self):
+        tok = "sag_cursor_helm_" + "ab12" * 12
         raw = (
-            "echo Authorization: Bearer sag_cursor_helm_abc123deadbeef "
+            f"echo Authorization: Bearer {tok} "
             "and github_pat_AAA_BBB"
         )
         tool_shell("test:agent", raw, "probe secrets")
         rows = query_audit_logs(agent_id="test:agent", limit=1)
         stored = json.dumps(rows[0])
-        self.assertNotIn("sag_cursor_helm_abc123deadbeef", stored)
+        self.assertNotIn(tok, stored)
         body = get_audit_event(rows[0]["id"])
         blob = json.dumps(body)
-        self.assertNotIn("sag_cursor_helm_abc123deadbeef", blob)
+        self.assertNotIn(tok, blob)
         self.assertNotIn("github_pat_AAA_BBB", blob)
         self.assertIn("***", blob)
+
+    def test_redact_sag_tokens_but_not_sag_names(self):
+        from sag.audit_redact import redact_secrets
+
+        real = issue_agent_token("wsl:red-team.x", "operator")
+        for secret in (real, real[:40], "TOKEN=" + real + ";"):
+            self.assertNotIn(real[:40], redact_secrets(secret), msg=secret)
+        for plain in (
+            "/tmp/sag_patches /tmp/sag_latest.bundle sag_2.1.1.bundle",
+            "cat /tmp/sag_rm_round3.txt; ls /opt/sag_data",
+            "python3 -m sag issue-token wsl:claude",
+        ):
+            self.assertEqual(redact_secrets(plain), plain)
 
     def test_query_audit_logs_omits_bodies(self):
         append_audit(

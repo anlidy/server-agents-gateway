@@ -8,7 +8,7 @@
 
 [English](README.md) | **简体中文**
 
-版本 **2.1.2**。设计说明：[docs/v2.md](docs/v2.md)。
+版本 **2.1.3**。设计说明：[docs/v2.md](docs/v2.md)。
 
 ## 做什么
 
