@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import stat
 import time
 from pathlib import Path
@@ -19,7 +20,7 @@ from .db import append_audit, get_audit_event, query_audit_logs
 from .executor import CommandExecutionError, execute_shell
 from .overview import overview_path, read_overview, select_sections, write_handwritten
 from .reconciler import collect_host_status, reconcile
-from .trash import ProtectedPathError, is_protected, list_trash, restore_trash, trash_put
+from .trash import ProtectedPathError, is_protected, lexical_path, list_trash, restore_trash, trash_put
 
 
 def _audit_then_raise(agent_id, tool_name, action_type, target, reason, status, exc, **kwargs):
@@ -291,7 +292,8 @@ def tool_patch_file(
         _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
     new = old.replace(old_string, new_string) if replace_all else old.replace(old_string, new_string, 1)
     replacements = n if replace_all else 1
-    trash_id = trash_put(target, source="patch_file", agent_id=agent_id)
+    # 旧内容复制进回收站，原文件原地重写：inode、属主、权限都不变（单文件 bind mount 靠这个）
+    trash_id = trash_put(target, source="patch_file", agent_id=agent_id, keep=True)
     if target.resolve() == overview_path().resolve():
         write_handwritten(new)
     else:
@@ -347,7 +349,7 @@ def tool_write_file(agent_id: str, path: str, content: str, reason: str) -> Dict
             old = target.read_text(encoding="utf-8")
         except Exception:
             old = ""
-        trash_id = trash_put(target, source="write_file", agent_id=agent_id)
+        trash_id = trash_put(target, source="write_file", agent_id=agent_id, keep=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.resolve() == overview_path().resolve():
         write_handwritten(content)
@@ -402,8 +404,8 @@ def tool_delete_file(
 
 
 def _delete_one(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
-    target = Path(path).resolve()
-    if is_protected(target):
+    target = lexical_path(path)  # a symlink is deleted as the link, like rm
+    if is_protected(target, follow=False):
         _audit_then_raise(
             agent_id,
             "hub_delete_file",
@@ -413,7 +415,7 @@ def _delete_one(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
             "REJECTED",
             ProtectedPathError(f"Refusing to modify protected path: {target}"),
         )
-    if not target.exists():
+    if not os.path.lexists(target):
         append_audit(
             agent_id=agent_id,
             tool_name="hub_delete_file",

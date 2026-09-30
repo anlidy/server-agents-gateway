@@ -1,5 +1,5 @@
 """
-Open bash -lc execution. rm is bound to the wrapper by absolute path.
+Open bash -lc execution. A top-level rm() (not exported) calls the recycle-bin wrapper.
 """
 
 from __future__ import annotations
@@ -49,19 +49,15 @@ def execute_shell(
         raise CommandExecutionError(f"cwd does not exist: {workdir}")
 
     env = os.environ.copy()
-    wrappers = Path(config.wrappers_dir).resolve()
-    abs_rm = wrappers / "rm"
-    path = str(wrappers) + os.pathsep + env.get("PATH", "")
-    env["PATH"] = path
+    abs_rm = Path(config.wrappers_dir).resolve() / "rm"
     if agent_id:
         env["SAG_AGENT_ID"] = agent_id
-    # Login shells rewrite PATH. Re-export an absolute wrappers dir and bind
-    # rm() to the wrapper's absolute path so `rm ./file` never depends on PATH.
-    setup = (
-        f"PATH={shlex.quote(path)}; export PATH; "
-        f"rm() {{ {shlex.quote(str(abs_rm))} \"$@\"; }}; "
-        f"export -f rm; "
-    )
+    # Only `rm` typed in this command line goes to the recycle bin: rm() lives in
+    # this one shell and is NOT exported, and the wrapper is NOT put on PATH.
+    # Child processes (dpkg maintainer scripts, make, installers, xargs, find
+    # -exec, sudo) get the real rm. Exporting it once made cloudflared's postrm
+    # trash the new binary behind a symlink during apt upgrade (2026-09-29).
+    setup = f"rm() {{ {shlex.quote(str(abs_rm))} \"$@\"; }}; "
 
     proc = subprocess.Popen(
         ["/bin/bash", "-lc", setup + cmd],

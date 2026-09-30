@@ -8,7 +8,7 @@
 
 [English](README.md) | **简体中文**
 
-版本 **2.1.1**。设计说明：[docs/v2.md](docs/v2.md)。
+版本 **2.1.2**。设计说明：[docs/v2.md](docs/v2.md)。
 
 ## 做什么
 
@@ -32,7 +32,7 @@
 这是有意的：个人服务器上 agent 要真正干活，绕道 SSH 反而更不可控。保留的安全网：
 
 - **审计**：每次改机器的调用都写 SQLite（命令、stdout/stderr、diff），可回放；
-- **回收站**：`hub_delete_file`、覆盖写、`hub_patch_file`、shell 里的 `rm` 都先进回收站（`/bin/rm` 仍是真删）；
+- **回收站**：`hub_delete_file`、覆盖写、`hub_patch_file`、shell 命令里直接写的 `rm` 都先进回收站（软链接只移走链接本身；子进程里的 rm 和 `/bin/rm` 仍是真删）；
 - **脱敏**：token、Bearer 头、常见 API key 进审计前打码（`sag/audit_redact.py`）；
 - **自保**：文件工具和 `rm` 包装器不碰 `data/`（数据库、回收站）和 `.env`，避免误删审计本身。
 
@@ -47,7 +47,7 @@
 
 | 工具 | 作用 |
 | :--- | :--- |
-| `hub_shell` | `bash -lc`。`rm` 进回收站；`/bin/rm` 仍是真删。 |
+| `hub_shell` | `bash -lc`。命令里直接写的 `rm` 进回收站；子进程和 `/bin/rm` 是真删。 |
 | `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | 文本文件。覆盖/局部替换/删除先进回收站。 |
 | `hub_list_dir` / `hub_mkdir` | 列目录；mkdir -p。 |
 | `hub_list_trash` / `hub_restore_file` | 按 id 还原，30 天过期。 |

@@ -170,6 +170,40 @@ def _session_is_stale(session_id: str) -> bool:
     return bool(session_id) and not session_id.startswith(BOOT_ID + ".")
 
 
+# 不按规范重新 initialize 的客户端（如 Operit）会一直带着旧会话 ID。每个旧 ID
+# 只回一次 404：守规范的客户端这一次就换了新会话；其余的第二次起放行，
+# 第一次放行时在工具结果末尾提示重连。只存在内存里，满了就清空重来。
+_STALE_SEEN: Dict[str, bool] = {}  # stale session id -> hint already shown
+_STALE_SEEN_MAX = 1000
+STALE_SESSION_HINT = (
+    "[SAG] 网关重启过，这个 MCP 会话是重启前建立的，工具列表可能已更新。"
+    "照常调用不受影响；重连 MCP 可拿到新工具。"
+)
+
+
+def _stale_session_action(session_id: str) -> str:
+    """'ok' | 'reject' (first time: 404) | 'hint' (second time: allow + hint) | 'allow'."""
+    if not _session_is_stale(session_id):
+        return "ok"
+    if session_id not in _STALE_SEEN:
+        if len(_STALE_SEEN) >= _STALE_SEEN_MAX:
+            _STALE_SEEN.clear()
+        _STALE_SEEN[session_id] = False
+        return "reject"
+    if not _STALE_SEEN[session_id]:
+        _STALE_SEEN[session_id] = True
+        return "hint"
+    return "allow"
+
+
+def _append_hint(response: Optional[Dict[str, Any]], hint: str) -> bool:
+    content = ((response or {}).get("result") or {}).get("content")
+    if isinstance(content, list):
+        content.append({"type": "text", "text": hint})
+        return True
+    return False
+
+
 async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rpc_id = rpc_req.get("id")
     method = rpc_req.get("method")
@@ -188,7 +222,7 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
                 },
                 "serverInfo": {
                     "name": "server-agents-gateway",
-                    "version": "2.1.1"
+                    "version": "2.1.2"
                 }
             }
         }
@@ -267,7 +301,9 @@ async def handle_streamable_post(
     Notifications/responses only -> 202. Requests -> one SSE stream when the client
     accepts it (with keepalive pings while tools run), otherwise a plain JSON body.
     """
-    if _session_is_stale(headers.get("mcp-session-id", "")):
+    session_id = headers.get("mcp-session-id", "")
+    stale = _stale_session_action(session_id)
+    if stale == "reject":
         err = {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": "Session expired (gateway restarted); re-initialize"}}
         _write_simple(writer, "404 Not Found", json.dumps(err).encode())
         return
@@ -288,6 +324,8 @@ async def handle_streamable_post(
 
     has_requests = any("method" in m and m.get("id") is not None for m in messages)
     if not has_requests:
+        if stale == "hint":
+            _STALE_SEEN[session_id] = False  # no tool result here to carry the hint
         for m in messages:
             if "method" in m:
                 await handle_jsonrpc(agent_id, role, m)
@@ -296,7 +334,10 @@ async def handle_streamable_post(
 
     async def run_all() -> list:
         results = await asyncio.gather(*(handle_jsonrpc(agent_id, role, m) for m in messages))
-        return [r for r in results if r]
+        results = [r for r in results if r]
+        if stale == "hint" and not any(_append_hint(r, STALE_SESSION_HINT) for r in results):
+            _STALE_SEEN[session_id] = False  # nothing to hang the hint on; show it next time
+        return results
 
     session_header = b""
     if any(m.get("method") == "initialize" for m in messages):
@@ -528,8 +569,63 @@ def main() -> None:
         agent = sys.argv[2] if len(sys.argv) > 2 else "desktop:cursor"
         token = issue_agent_token(agent, role="operator")
         print(f"Issued operator token for [{agent}]: {token}")
+    elif len(sys.argv) > 1 and sys.argv[1] == "purge-trash":
+        init_db()
+        sys.exit(_purge_trash_cli(sys.argv[2:]))
     else:
         asyncio.run(run_server())
+
+
+def _purge_trash_cli(argv: list) -> int:
+    """
+    Root-only escape hatch: permanently delete recycle-bin items before they expire.
+    Deliberately not an MCP tool, so agents can't empty the safety net themselves.
+    Dry run unless --yes. Every real purge is audited.
+    """
+    import argparse
+
+    from .db import append_audit
+    from .trash import purge_trash_items, select_trash
+
+    ap = argparse.ArgumentParser(prog="python3 -m sag purge-trash")
+    ap.add_argument("--id", action="append", dest="ids", help="trash id; repeatable")
+    ap.add_argument("--deleted-by", help="agent_id that deleted the items")
+    ap.add_argument("--since", help="deleted_at >= (ISO, e.g. 2026-09-29T23:20)")
+    ap.add_argument("--until", help="deleted_at <= (ISO)")
+    ap.add_argument("--prefix", help="original_path prefix")
+    ap.add_argument("--reason", default="", help="recorded in the audit log")
+    ap.add_argument("--yes", action="store_true", help="actually delete (default: dry run)")
+    args = ap.parse_args(argv)
+
+    rows = select_trash(args.ids, args.deleted_by, args.since, args.until, args.prefix)
+    if not rows:
+        print("No matching trash items (at least one filter is required).")
+        return 1
+    total = sum(r["size_bytes"] or 0 for r in rows)
+    for r in rows:
+        print(f"{r['id']}  {r['deleted_at']}  {r['deleted_by']:<16} {r['size_bytes'] or 0:>12}  {r['original_path']}")
+    print(f"{len(rows)} items, {total / 1048576:.1f} MiB")
+    if not args.yes:
+        print("Dry run. Re-run with --yes to delete permanently.")
+        return 0
+    n = purge_trash_items([r["id"] for r in rows])
+    append_audit(
+        agent_id="root:cli",
+        tool_name="purge-trash",
+        action_type="trash_purge",
+        target=args.prefix or args.deleted_by or "trash",
+        reason=args.reason or "manual purge",
+        status="SUCCESS",
+        params={
+            "filters": {k: v for k, v in vars(args).items() if k not in ("yes", "reason") and v},
+            "count": n,
+            "bytes": total,
+            "ids": [r["id"] for r in rows],
+            "paths": [r["original_path"] for r in rows],
+        },
+    )
+    print(f"Purged {n} items.")
+    return 0
 
 
 if __name__ == "__main__":

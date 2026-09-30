@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -199,6 +200,132 @@ class TestGatewayV2(unittest.TestCase):
         stored = Path(items[0]["original_path"])
         self.assertTrue(stored.is_absolute(), msg=items[0]["original_path"])
         self.assertEqual(stored, target.resolve())
+
+    def test_rm_symlink_trashes_link_not_target(self):
+        cwd = Path(config.shell_cwd)
+        real = cwd / "real.bin"
+        real.write_text("payload")
+        link = cwd / "link.bin"
+        link.symlink_to(real)
+        res = tool_shell("test:agent", f"rm -f {link}", "rm link")
+        self.assertEqual(res["exit_code"], 0, msg=res["stderr"])
+        self.assertFalse(os.path.lexists(link))
+        self.assertEqual(real.read_text(), "payload")
+        item = list_trash()[0]
+        self.assertEqual(item["original_path"], str(link))
+        tool_restore_file("test:agent", item["id"], "back")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(link), str(real))
+
+    def test_rm_broken_symlink(self):
+        link = Path(config.shell_cwd) / "dangling"
+        link.symlink_to("/nonexistent/target")
+        res = tool_shell("test:agent", f"rm {link}", "rm dangling")
+        self.assertEqual(res["exit_code"], 0, msg=res["stderr"])
+        self.assertFalse(os.path.lexists(link))
+
+    def test_rm_symlink_to_dir_without_r(self):
+        cwd = Path(config.shell_cwd)
+        (cwd / "d").mkdir()
+        (cwd / "d" / "f").write_text("x")
+        (cwd / "dl").symlink_to(cwd / "d")
+        res = tool_shell("test:agent", "rm dl", "rm dir link", cwd=str(cwd))
+        self.assertEqual(res["exit_code"], 0, msg=res["stderr"])
+        self.assertTrue((cwd / "d" / "f").exists())
+        self.assertFalse(os.path.lexists(cwd / "dl"))
+
+    def test_rm_wrapper_not_inherited_by_children(self):
+        cwd = Path(config.shell_cwd)
+        res = tool_shell(
+            "test:agent",
+            "type -t rm; bash -c 'type -t rm'; sh -c 'command -v rm'; echo \"$PATH\"",
+            "scope",
+        )
+        lines = res["stdout"].splitlines()
+        self.assertEqual(lines[0], "function")
+        self.assertEqual(lines[1], "file")
+        self.assertIn(lines[2], ("/usr/bin/rm", "/bin/rm"))
+        self.assertNotIn("wrappers", lines[3])
+        (cwd / "child.txt").write_text("x")
+        res = tool_shell("test:agent", "bash -c 'rm child.txt'", "child rm", cwd=str(cwd))
+        self.assertEqual(res["exit_code"], 0, msg=res["stderr"])
+        self.assertFalse((cwd / "child.txt").exists())
+        self.assertEqual(list_trash(), [])
+
+    def test_delete_file_symlink_keeps_target(self):
+        cwd = Path(config.shell_cwd)
+        real = cwd / "t.txt"
+        real.write_text("t")
+        link = cwd / "t.link"
+        link.symlink_to(real)
+        res = tool_delete_file("test:agent", str(link), "unlink")
+        self.assertEqual(res["status"], "TRASHED")
+        self.assertEqual(res["path"], str(link))
+        self.assertTrue(real.exists())
+        self.assertFalse(os.path.lexists(link))
+
+    def test_symlink_into_data_dir_is_deletable_but_data_is_not(self):
+        link = Path(config.shell_cwd) / "db.link"
+        link.symlink_to(config.db_path)
+        self.assertEqual(tool_delete_file("test:agent", str(link), "x")["status"], "TRASHED")
+        self.assertTrue(Path(config.db_path).exists())
+        with self.assertRaises(ProtectedPathError):
+            tool_delete_file("test:agent", config.db_path, "x")
+
+    def test_write_and_patch_keep_inode_and_mode(self):
+        f = Path(config.shell_cwd) / "conf.yaml"
+        f.write_text("a: 1\n")
+        os.chmod(f, 0o600)
+        ino = f.stat().st_ino
+        tool_patch_file("test:agent", str(f), "a: 1", "a: 2", "p")
+        self.assertEqual((f.stat().st_ino, f.stat().st_mode & 0o777), (ino, 0o600))
+        tool_write_file("test:agent", str(f), "a: 3\n", "w")
+        self.assertEqual((f.stat().st_ino, f.stat().st_mode & 0o777), (ino, 0o600))
+        self.assertEqual(f.read_text(), "a: 3\n")
+        self.assertEqual(len(list_trash()), 2)
+
+    def test_write_through_symlink_keeps_link(self):
+        cwd = Path(config.shell_cwd)
+        real = cwd / "r.txt"
+        real.write_text("old")
+        link = cwd / "r.link"
+        link.symlink_to(real)
+        tool_write_file("test:agent", str(link), "new", "w")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(real.read_text(), "new")
+
+    def test_move_symlink_across_devices(self):
+        import errno as _errno
+        from unittest import mock
+
+        from sag import trash as trash_mod
+
+        cwd = Path(config.shell_cwd)
+        real = cwd / "big"
+        real.write_text("x" * 100)
+        link = cwd / "big.link"
+        link.symlink_to(real)
+        dst = cwd / "moved" / "payload"
+        with mock.patch.object(trash_mod.os, "rename", side_effect=OSError(_errno.EXDEV, "cross")):
+            trash_mod._move(link, dst)
+        self.assertTrue(dst.is_symlink())
+        self.assertTrue(real.exists())
+        self.assertFalse(os.path.lexists(link))
+
+    def test_purge_trash_items(self):
+        from sag.trash import purge_trash_items, select_trash
+
+        cwd = Path(config.shell_cwd)
+        for n in ("p1", "p2"):
+            (cwd / n).write_text(n)
+            tool_delete_file("test:agent", str(cwd / n), "x")
+        self.assertEqual(select_trash(), [])
+        rows = select_trash(deleted_by="test:agent")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(purge_trash_items([rows[0]["id"]]), 1)
+        self.assertEqual(len(list_trash()), 1)
+        trash_dir = Path(config.db_path).parent / "trash" / rows[0]["id"]
+        self.assertFalse(trash_dir.exists())
 
     def test_rm_wrapper_survives_path_reset(self):
         target = Path(config.shell_cwd) / "still.txt"
@@ -907,12 +1034,33 @@ class TestStreamableSession(unittest.TestCase):
         self.assertTrue(head.startswith("HTTP/1.1 200"))
         self.assertNotIn("Mcp-Session-Id", head)
 
-    def test_stale_session_gets_404(self):
-        head, payload = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session="0ld.boot")
+    def test_stale_session_404_once_then_allowed_with_one_hint(self):
+        from sag.server import STALE_SESSION_HINT
+
+        sid = "0ld.boot-" + uuid.uuid4().hex
+        call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "hub_list_tasks", "arguments": {}}}
+        head, payload = self._post(call, session=sid)
         self.assertTrue(head.startswith("HTTP/1.1 404"))
         self.assertIn(b"re-initialize", payload)
-        head, _ = self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session="0ld.boot")
-        self.assertTrue(head.startswith("HTTP/1.1 404"))
+        # 不重新 initialize 的客户端：第二次放行并提示一次，之后不再提示
+        head, payload = self._post(call, session=sid)
+        self.assertTrue(head.startswith("HTTP/1.1 200"))
+        texts = [c["text"] for c in json.loads(payload)["result"]["content"]]
+        self.assertIn(STALE_SESSION_HINT, texts)
+        head, payload = self._post(call, session=sid)
+        self.assertTrue(head.startswith("HTTP/1.1 200"))
+        self.assertNotIn(STALE_SESSION_HINT, payload.decode())
+
+    def test_stale_hint_waits_for_a_tool_result(self):
+        from sag.server import STALE_SESSION_HINT
+
+        sid = "0ld.boot-" + uuid.uuid4().hex
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, session=sid)  # 404
+        head, _ = self._post({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}, session=sid)
+        self.assertTrue(head.startswith("HTTP/1.1 200"))
+        call = {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "hub_list_tasks", "arguments": {}}}
+        _, payload = self._post(call, session=sid)
+        self.assertIn(STALE_SESSION_HINT, payload.decode())
 
     def test_no_session_header_still_allowed(self):
         head, _ = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})

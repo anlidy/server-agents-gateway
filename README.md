@@ -8,7 +8,7 @@ A personal-server hub for multiple AI agents. MCP over Streamable HTTP (`/mcp`; 
 
 **English** | [简体中文](README_zh.md)
 
-Version **2.1.1**. Design notes: [docs/v2.md](docs/v2.md).
+Version **2.1.2**. Design notes: [docs/v2.md](docs/v2.md).
 
 ## What it does
 
@@ -28,7 +28,7 @@ Safety is audit + trash, not a command allowlist.
 
 | Tool | Role |
 | :--- | :--- |
-| `hub_shell` | `bash -lc`. `rm` is wrapped into trash; `/bin/rm` is a real delete. |
+| `hub_shell` | `bash -lc`. `rm` typed in the command goes to trash (symlinks as links); child processes and `/bin/rm` delete for real. |
 | `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | Text files. Overwrite/patch/delete → recycle bin. |
 | `hub_list_dir` / `hub_mkdir` | List a directory; mkdir -p. |
 | `hub_list_trash` / `hub_restore_file` | Restore by id. 30-day expiry. |
@@ -87,7 +87,7 @@ Systemd unit: [deploy/server-agents-gateway.service](deploy/server-agents-gatewa
 
 ```
 sag/                 # application package
-wrappers/rm          # PATH wrapper → recycle bin
+wrappers/rm          # rm() target (top-level shell only) → recycle bin
 tests/               # unit tests
 docs/v2.md           # design
 deploy/              # systemd + ingress notes

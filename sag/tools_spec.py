@@ -7,7 +7,9 @@ MCP_TOOLS_SPEC = [
             "Run a command with bash -lc (pipes and redirects work). "
             "Runs as root on the host with no sandbox: /etc, /usr, /root and systemd are writable, "
             "and /tmp is the same /tmp that SSH sessions see. Every call is audited. "
-            "rm is bound to an absolute-path recycle-bin wrapper; /bin/rm still deletes for real. "
+            "`rm` typed directly in this command goes to the recycle bin (a symlink is trashed as the link, "
+            "never its target). Child processes (scripts, dpkg/apt, make, xargs, find -exec, sudo) and "
+            "/bin/rm use the real rm and delete for real. "
             "If you add, remove, or move a service, update the matching ### in SERVER_AGENTS.md "
             "Inventory (see ## Conventions for `- probe:` format) in the same turn."
         ),
@@ -59,7 +61,8 @@ MCP_TOOLS_SPEC = [
     {
         "name": "hub_write_file",
         "description": (
-            "Write a text file. Existing content is moved to the recycle bin first. "
+            "Write a text file. Existing content is copied to the recycle bin first, then the file is "
+            "rewritten in place (same inode, owner and mode; safe for single-file bind mounts). "
             "If you change topology (new service, URL, path), add or edit a ### section "
             "under ## Inventory, including a `- probe:` line if it should be health-checked. "
             "Format is in ## Conventions of SERVER_AGENTS.md."
@@ -79,6 +82,7 @@ MCP_TOOLS_SPEC = [
         "description": (
             "Replace old_string with new_string in a text file. "
             "Fails if old_string is missing or matches more than once (unless replace_all). "
+            "Rewrites in place (same inode, owner and mode). "
             "Previous content goes to the recycle bin."
         ),
         "inputSchema": {
@@ -96,7 +100,7 @@ MCP_TOOLS_SPEC = [
     {
         "name": "hub_delete_file",
         "description": (
-            "Move files or directories to the recycle bin (30-day retention). "
+            "Move files or directories to the recycle bin (30-day retention). A symlink is moved as the link. "
             "Give `path` for one, or `paths` for several (each gets its own audit entry and trash_id). "
             "If this removes a service or project, update SERVER_AGENTS.md Inventory."
         ),
