@@ -420,6 +420,30 @@ class TestGatewayV2(unittest.TestCase):
         ):
             self.assertEqual(redact_secrets(plain), plain)
 
+    def test_backup_database_keeps_newest(self):
+        from sag.db import backup_database
+
+        data = Path(config.db_path).parent
+        old = data / (Path(config.db_path).name + ".bak-20200101")
+        old.write_text("old")
+        os.utime(old, (1, 1))
+        first = backup_database("v1", keep=2)
+        self.assertEqual(first["removed"], [])
+        self.assertEqual(os.stat(first["backup"]).st_mode & 0o777, 0o600)
+        time.sleep(1.1)
+        second = backup_database("v2")  # default keep = 1
+        self.assertIn(".bak-v2-", second["backup"])
+        self.assertEqual(sorted(second["removed"]), sorted([str(old), first["backup"]]))
+        left = sorted(p.name for p in data.glob(Path(config.db_path).name + ".bak-*"))
+        self.assertEqual(left, [Path(second["backup"]).name])
+        self.assertTrue(Path(config.db_path).exists())
+        import sqlite3 as _sq
+
+        n = _sq.connect(second["backup"]).execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
+        self.assertGreater(n, 0)
+        with self.assertRaises(ValueError):
+            backup_database(keep=0)
+
     def test_query_audit_logs_omits_bodies(self):
         append_audit(
             agent_id="test:agent",

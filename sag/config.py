@@ -66,6 +66,8 @@ class Config:
     shell_timeout_max: int = int(os.getenv("GATEWAY_SHELL_TIMEOUT_MAX", "3600"))
     audit_body_max_bytes: int = int(os.getenv("GATEWAY_AUDIT_BODY_MAX_BYTES", str(2 * 1024 * 1024)))
     trash_retention_days: int = int(os.getenv("GATEWAY_TRASH_RETENTION_DAYS", "30"))
+    # backup-db keeps this many gateway.db.bak-* files (newest first)
+    db_backup_keep: int = int(os.getenv("GATEWAY_DB_BACKUP_KEEP", "1"))
     reconcile_interval_seconds: int = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
     # Kept so existing .env files still load; unused in v2.
     ai_provider_enabled: bool = os.getenv("AI_PROVIDER_ENABLED", "true").lower() in ("true", "1", "yes")

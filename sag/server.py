@@ -569,11 +569,40 @@ def main() -> None:
         agent = sys.argv[2] if len(sys.argv) > 2 else "desktop:cursor"
         token = issue_agent_token(agent, role="operator")
         print(f"Issued operator token for [{agent}]: {token}")
+    elif len(sys.argv) > 1 and sys.argv[1] == "backup-db":
+        init_db()
+        sys.exit(_backup_db_cli(sys.argv[2:]))
     elif len(sys.argv) > 1 and sys.argv[1] == "purge-trash":
         init_db()
         sys.exit(_purge_trash_cli(sys.argv[2:]))
     else:
         asyncio.run(run_server())
+
+
+def _backup_db_cli(argv: list) -> int:
+    """Before a release: back up gateway.db and keep only the newest N backups (default 1)."""
+    import argparse
+
+    from .db import append_audit, backup_database
+
+    ap = argparse.ArgumentParser(prog="python3 -m sag backup-db")
+    ap.add_argument("--label", default="", help="e.g. the version being replaced: 2.1.3")
+    ap.add_argument("--keep", type=int, default=None, help=f"backups to keep (default {config.db_backup_keep})")
+    args = ap.parse_args(argv)
+    res = backup_database(args.label, args.keep)
+    append_audit(
+        agent_id="root:cli",
+        tool_name="backup-db",
+        action_type="db_backup",
+        target=res["backup"],
+        reason=f"backup before release {args.label}".strip(),
+        status="SUCCESS",
+        params={"removed": res["removed"]},
+    )
+    print(f"Backup: {res['backup']}")
+    for p in res["removed"]:
+        print(f"Removed old backup: {p}")
+    return 0
 
 
 def _purge_trash_cli(argv: list) -> int:

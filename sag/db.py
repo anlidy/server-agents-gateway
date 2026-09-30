@@ -358,3 +358,34 @@ def get_audit_event(event_id: str) -> Dict[str, Any]:
         if not row:
             raise ValueError(f"Audit event not found: {event_id}")
         return dict(row)
+
+
+def backup_database(label: str = "", keep: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Online-copy gateway.db to <db>.bak-[<label>-]<timestamp> (mode 600), then delete
+    older <db>.bak-* files so only the newest `keep` remain (default config.db_backup_keep).
+    """
+    keep = config.db_backup_keep if keep is None else keep
+    if keep < 1:
+        raise ValueError("keep must be >= 1")
+    db_file = Path(config.db_path)
+    stamp = time.strftime("%Y%m%d%H%M%S")
+    dest = db_file.with_name(f"{db_file.name}.bak-{label + '-' if label else ''}{stamp}")
+    src = sqlite3.connect(str(db_file))
+    dst = sqlite3.connect(str(dest))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    dest.chmod(0o600)
+    backups = sorted(
+        (p for p in db_file.parent.glob(db_file.name + ".bak-*") if p.is_file() and not p.is_symlink()),
+        key=lambda p: (p.stat().st_mtime, p.name),
+        reverse=True,
+    )
+    removed = []
+    for old in backups[keep:]:
+        old.unlink()
+        removed.append(str(old))
+    return {"backup": str(dest), "kept": [str(p) for p in backups[:keep]], "removed": removed}
