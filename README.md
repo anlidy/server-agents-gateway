@@ -11,7 +11,7 @@
 
 The assistant on your phone, Claude Code on your laptop, Cursor, a cron bot: they all want to work on the same VPS. Handing each one an SSH key leaves you with no record of who ran what, no undo, and no way for the agents to coordinate.
 
-SAG is a single MCP server you run on that box. Every agent connects with its own token and gets a real shell. Every call is recorded. Deleted files go to a recycle bin. The agents share one markdown map of the server and can message each other or hand off tasks.
+SAG is a single MCP server you run on that box. Every agent connects with its own token and gets a real shell. Every command, file change, message and task update is recorded, and so is every call that fails. Deleted files go to a recycle bin. The agents share one markdown map of the server and can message each other or hand off tasks.
 
 One Python process, standard library only. Version **2.1.3**.
 
@@ -59,7 +59,7 @@ The `rm` was a real shell command, yet the file landed in the trash. The phone a
 
 | | One SSH key per agent | SAG |
 | :--- | :--- | :--- |
-| Who did what | Shell history, if it survived | Every call: agent, command, required `reason`, full stdout/stderr, file diff |
+| Who did what | Shell history, if it survived | Every command and file change, and every failed call: agent, command, required `reason`, full stdout/stderr, file diff |
 | A bad `rm` | Gone | Recycle bin, restore by id, 30 days |
 | "What runs on this box?" | Each agent rediscovers it | One shared `SERVER_AGENTS.md`, status section kept fresh by the gateway |
 | Agents coordinating | Notes left in `/tmp` | Inbox, threads, read receipts, task handoff |
@@ -98,9 +98,9 @@ Agents talk with `hub_send_message` instead of leaving notes in files. Long-live
 | Tool | Role |
 | :--- | :--- |
 | `hub_shell` | `bash -lc`. `command` and `reason` required. An `rm` typed in the command goes to the trash; child processes and `/bin/rm` delete for real. Output is capped at 2 MiB. Redirect the output of background jobs (`nohup cmd >log 2>&1 &`), or the call waits for them until the timeout. |
-| `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | Text files. Overwrite, patch and delete move the old version to the trash. A read returns at most 2 MiB; continue from `next_offset`. |
+| `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | Text files. Overwrite, patch and delete move the old version to the trash. A read returns at most 2 MiB of whole lines; continue from `next_offset`. Pipes and devices are refused. |
 | `hub_list_dir` / `hub_mkdir` | List a directory; `mkdir -p`. |
-| `hub_list_trash` / `hub_restore_file` | Restore by id. 30-day expiry. |
+| `hub_list_trash` / `hub_restore_file` | Restore by id. 30-day expiry. `overwrite=true` puts the item back over what is there now (which goes into the trash first), so an overwrite can be undone. |
 | `hub_get_overview` / `hub_rebuild_overview` | Read `SERVER_AGENTS.md`; rebuild only refreshes the status section. |
 | `hub_get_status` | Load, memory, disks, failed units, service probes. |
 | `hub_query_audit_logs` / `hub_get_audit_event` | Event list vs. full stdout/stderr/diff. |
@@ -178,6 +178,8 @@ GATEWAY_SHELL_TIMEOUT_SECONDS=120
 GATEWAY_SHELL_TIMEOUT_MAX=3600
 GATEWAY_AUDIT_BODY_MAX_BYTES=2097152
 GATEWAY_READ_MAX_BYTES=2097152
+GATEWAY_MAX_REQUEST_BYTES=16777216
+GATEWAY_MAX_WORKERS=64
 GATEWAY_TRASH_RETENTION_DAYS=30
 RECONCILE_INTERVAL_SECONDS=60
 ```
