@@ -4,6 +4,7 @@ v2 MCP tool implementations.
 
 from __future__ import annotations
 
+import codecs
 import difflib
 import json
 import os
@@ -75,6 +76,19 @@ def tool_shell(
             stderr=str(exc),
         )
         raise
+    except Exception as exc:
+        # Anything else (spawn failure, bad arguments, a bug) still leaves a trace: every call is audited.
+        append_audit(
+            agent_id=agent_id,
+            tool_name="hub_shell",
+            action_type="shell_exec",
+            target=(command or "")[:200],
+            reason=reason,
+            status="ERROR",
+            params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
+            stderr=f"{type(exc).__name__}: {exc}",
+        )
+        raise
     finally:
         try:
             reconcile()
@@ -115,6 +129,54 @@ def tool_shell(
     }
 
 
+_SKIP_CHUNK = 64 * 1024
+
+
+def _skip_line(f) -> bool:
+    """Consume one line without keeping it, however long it is. False at EOF."""
+    seen = False
+    while True:
+        part = f.readline(_SKIP_CHUNK)
+        if not part:
+            return seen
+        seen = True
+        if part.endswith(b"\n"):
+            return True
+
+
+def _read_window(target: Path, start: int, max_lines: Optional[int], cap: int):
+    """
+    Lines [start, start + max_lines) of a file as bytes, read without loading the whole
+    file and never holding more than `cap` bytes. Lines end at b"\\n" only, like sed and
+    cat -n. Returns (data, full_lines, cut): `cut` is None when nothing was held back,
+    "line" when the cap ran out exactly at a line boundary, "partial" when the last line
+    was cut short.
+    """
+    chunks: List[bytes] = []
+    size = full = 0
+    cut: Optional[str] = None
+    with open(target, "rb") as f:
+        for _ in range(start):
+            if not _skip_line(f):
+                return b"", 0, None
+        while max_lines is None or full < max_lines:
+            room = cap - size
+            line = f.readline(room + 1)
+            if not line:
+                break
+            if len(line) > room:
+                if room > 0:
+                    chunks.append(line[:room])
+                    cut = "partial"
+                else:
+                    cut = "line"
+                break
+            chunks.append(line)
+            size += len(line)
+            full += 1
+    return b"".join(chunks), full, cut
+
+
 def tool_read_file(
     agent_id: str,
     path: str,
@@ -135,18 +197,32 @@ def tool_read_file(
     if target.is_dir():
         exc = IsADirectoryError(str(target))
         _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
-    raw = target.read_bytes()
-    if b"\x00" in raw[:8192]:
+    with open(target, "rb") as f:
+        head = f.read(8192)
+    if b"\x00" in head:
         exc = ValueError("binary file")
         _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
+    start = max(int(offset) - 1, 0)
+    max_lines = None if limit is None else max(int(limit), 0)
+    cap = max(1, config.read_max_bytes)
+    data, full_lines, cut = _read_window(target, start, max_lines, cap)
     try:
-        text = raw.decode("utf-8")
+        # A cut in the middle of a line may split a multi-byte character: hold that tail back.
+        content = codecs.getincrementaldecoder("utf-8")().decode(data, final=cut != "partial")
     except UnicodeDecodeError as exc:
         _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
-    lines = text.splitlines(True)
-    start = max(int(offset) - 1, 0)
-    chunk = lines[start:] if limit is None else lines[start : start + int(limit)]
-    content = "".join(chunk)
+    result: Dict[str, Any] = {"path": str(target), "content": content}
+    params: Dict[str, Any] = {"offset": offset, "limit": limit}
+    if cut:
+        # Resume after the line that was cut; the rest of that line is not reachable by line number.
+        next_offset = start + full_lines + (2 if cut == "partial" else 1)
+        result["truncated"] = True
+        result["next_offset"] = next_offset
+        result["note"] = (
+            f"Capped at {cap} bytes (GATEWAY_READ_MAX_BYTES). Continue with offset={next_offset}; "
+            "use hub_shell for byte ranges."
+        )
+        params["truncated"] = True
     append_audit(
         agent_id=agent_id,
         tool_name="hub_read_file",
@@ -155,9 +231,9 @@ def tool_read_file(
         reason="",
         status="SUCCESS",
         stdout=content,
-        params={"offset": offset, "limit": limit},
+        params=params,
     )
-    return {"path": str(target), "content": content}
+    return result
 
 
 def tool_list_dir(agent_id: str, path: str) -> Dict[str, Any]:

@@ -111,8 +111,8 @@ agent 之间要说话（提问、回答、交接、"我改了 X，你看一下 Y
 
 | 工具 | 作用 |
 | :--- | :--- |
-| `hub_shell` | `bash -lc`，`command` 和 `reason` 必填。命令里直接写的 `rm` 进回收站；子进程和 `/bin/rm` 是真删。 |
-| `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | 文本文件。覆盖、局部替换、删除都先把旧版本放进回收站。 |
+| `hub_shell` | `bash -lc`，`command` 和 `reason` 必填。命令里直接写的 `rm` 进回收站；子进程和 `/bin/rm` 是真删。输出上限 2MiB。后台任务要重定向输出（`nohup cmd >log 2>&1 &`），否则这次调用会一直等到超时。 |
+| `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | 文本文件。覆盖、局部替换、删除都先把旧版本放进回收站。读文件一次最多返回 2MiB，超出从 `next_offset` 接着读。 |
 | `hub_list_dir` / `hub_mkdir` | 列目录；mkdir -p。 |
 | `hub_list_trash` / `hub_restore_file` | 按 id 还原，30 天过期。 |
 | `hub_get_overview` / `hub_rebuild_overview` | 读 `SERVER_AGENTS.md`；rebuild 只刷新状态区。 |
@@ -191,6 +191,7 @@ GATEWAY_SHELL_CWD=
 GATEWAY_SHELL_TIMEOUT_SECONDS=120
 GATEWAY_SHELL_TIMEOUT_MAX=3600
 GATEWAY_AUDIT_BODY_MAX_BYTES=2097152
+GATEWAY_READ_MAX_BYTES=2097152
 GATEWAY_TRASH_RETENTION_DAYS=30
 RECONCILE_INTERVAL_SECONDS=60
 ```

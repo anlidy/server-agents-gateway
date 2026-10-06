@@ -65,6 +65,8 @@ class Config:
     shell_timeout_seconds: int = int(os.getenv("GATEWAY_SHELL_TIMEOUT_SECONDS", "120"))
     shell_timeout_max: int = int(os.getenv("GATEWAY_SHELL_TIMEOUT_MAX", "3600"))
     audit_body_max_bytes: int = int(os.getenv("GATEWAY_AUDIT_BODY_MAX_BYTES", str(2 * 1024 * 1024)))
+    # hub_read_file returns at most this many bytes per call (the caller continues with next_offset)
+    read_max_bytes: int = int(os.getenv("GATEWAY_READ_MAX_BYTES", str(2 * 1024 * 1024)))
     trash_retention_days: int = int(os.getenv("GATEWAY_TRASH_RETENTION_DAYS", "30"))
     # backup-db keeps this many gateway.db.bak-* files (newest first)
     db_backup_keep: int = int(os.getenv("GATEWAY_DB_BACKUP_KEEP", "1"))
