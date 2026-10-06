@@ -11,6 +11,7 @@ import json
 import sys
 import urllib.parse
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
 from . import collab
@@ -281,13 +282,35 @@ def _append_hint(response: Optional[Dict[str, Any]], hint: str) -> bool:
     return False
 
 
-async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _rpc_error(rpc_id: Any, code: int, message: str) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}
+
+
+async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(rpc_req, dict):
+        return _rpc_error(None, -32600, "Invalid Request")
     rpc_id = rpc_req.get("id")
+    try:
+        return await _handle_jsonrpc(agent_id, role, rpc_req, rpc_id)
+    except Exception as exc:
+        # A bug must not drop the connection, nor take the other calls of a batch down with it.
+        print(
+            f"[server] internal error handling {str(rpc_req.get('method'))[:60]!r}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return _rpc_error(rpc_id, -32603, "Internal error") if rpc_id is not None else None
+
+
+async def _handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any], rpc_id: Any) -> Optional[Dict[str, Any]]:
     method = rpc_req.get("method")
-    params = rpc_req.get("params", {})
+    params = rpc_req.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return _rpc_error(rpc_id, -32602, "Invalid params: expected an object") if rpc_id is not None else None
 
     if method == "initialize":
-        requested = (params or {}).get("protocolVersion")
+        requested = params.get("protocolVersion")
         version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else SUPPORTED_PROTOCOL_VERSIONS[0]
         return {
             "jsonrpc": "2.0",
@@ -322,7 +345,7 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
 
     if method == "tools/call":
         tool_name = params.get("name")
-        arguments = params.get("arguments", {})
+        arguments = params.get("arguments")
         try:
             # Run in a thread so long shell commands don't stall other clients or keepalives
             result = await asyncio.to_thread(dispatch_tool, agent_id, role, tool_name, arguments)
@@ -340,24 +363,10 @@ async def handle_jsonrpc(agent_id: str, role: str, rpc_req: Dict[str, Any]) -> O
                 "result": {"content": content},
             }
         except Exception as e:
-            return {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "error": {
-                    "code": -32000,
-                    "message": str(e)
-                }
-            }
+            return _rpc_error(rpc_id, -32000, str(e))
 
     if rpc_id is not None:
-        return {
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "error": {
-                "code": -32601,
-                "message": f"Method not found: {method}"
-            }
-        }
+        return _rpc_error(rpc_id, -32601, f"Method not found: {method}")
     return None
 
 
@@ -451,30 +460,80 @@ async def handle_streamable_post(
     await writer.drain()
 
 
+# A client that connects and then sends nothing (or one byte a minute) must not hold a connection forever.
+HEADER_TIMEOUT = 15.0
+BODY_TIMEOUT = 120.0
+MAX_HEADER_LINES = 100
+
+
+def _http_error(writer: asyncio.StreamWriter, status: str, message: str) -> None:
+    _write_simple(writer, status, json.dumps({"error": message}).encode())
+
+
+async def _read_head(reader: asyncio.StreamReader):
+    """(method, target, headers), None for an empty or malformed request line, "too_many" for a header flood."""
+    request_line = await reader.readline()
+    if not request_line:
+        return None
+    parts = request_line.decode("utf-8", errors="ignore").strip().split()
+    if len(parts) < 2:
+        return None
+    headers: Dict[str, str] = {}
+    for _ in range(MAX_HEADER_LINES + 1):
+        header_line = await reader.readline()
+        if not header_line or header_line == b"\r\n" or header_line == b"\n":
+            return parts[0], parts[1], headers
+        h_str = header_line.decode("utf-8", errors="ignore").strip()
+        if ":" in h_str:
+            k, v = h_str.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    return "too_many"
+
+
+async def _read_body(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, headers: Dict[str, str], default: bytes = b""
+) -> Optional[bytes]:
+    """The request body, or None once an error response has been written (or the client went away)."""
+    if "transfer-encoding" in headers:
+        _http_error(writer, "411 Length Required", "chunked request bodies are not supported; send Content-Length")
+        return None
+    raw = headers.get("content-length", "")
+    if raw == "":
+        return default
+    if not raw.isdigit():
+        _http_error(writer, "400 Bad Request", "invalid Content-Length")
+        return None
+    length = int(raw)
+    if length > config.max_request_bytes:
+        _http_error(writer, "413 Payload Too Large", f"request body over {config.max_request_bytes} bytes")
+        return None
+    if length == 0:
+        return default
+    try:
+        return await asyncio.wait_for(reader.readexactly(length), BODY_TIMEOUT)
+    except asyncio.TimeoutError:
+        _http_error(writer, "408 Request Timeout", "request body not received in time")
+    except asyncio.IncompleteReadError:
+        pass  # the client hung up mid-body: nobody to answer
+    return None
+
+
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
-        # Read HTTP request line
-        request_line = await reader.readline()
-        if not request_line:
+        try:
+            head = await asyncio.wait_for(_read_head(reader), HEADER_TIMEOUT)
+        except asyncio.TimeoutError:
             writer.close()
             return
-        line_str = request_line.decode("utf-8", errors="ignore").strip()
-        parts = line_str.split()
-        if len(parts) < 2:
+        if head is None:
             writer.close()
             return
-        method, full_path = parts[0], parts[1]
-
-        # Read Headers
-        headers = {}
-        while True:
-            header_line = await reader.readline()
-            if not header_line or header_line == b"\r\n" or header_line == b"\n":
-                break
-            h_str = header_line.decode("utf-8", errors="ignore").strip()
-            if ":" in h_str:
-                k, v = h_str.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
+        if head == "too_many":
+            _http_error(writer, "431 Request Header Fields Too Large", "too many headers")
+            await writer.drain()
+            writer.close()
+            return
+        method, full_path, headers = head
 
         parsed_url = urllib.parse.urlparse(full_path)
         path = parsed_url.path
@@ -494,7 +553,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if not auth_header and "token" in query:
             auth_header = f"Bearer {query['token'][0]}"
 
-        auth_res = authenticate_bearer_token(auth_header)
+        auth_res = await asyncio.to_thread(authenticate_bearer_token, auth_header)
         if not auth_res:
             body = b'{"error": "Unauthorized: Invalid or missing Bearer token"}'
             writer.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
@@ -516,9 +575,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         # /mcp (MCP Streamable HTTP). No server-initiated stream, so GET/DELETE are 405.
         if path == "/mcp":
             if method == "POST":
-                content_length = int(headers.get("content-length", 0))
-                body_data = await reader.readexactly(content_length) if content_length > 0 else b""
-                await handle_streamable_post(agent_id, role, headers, body_data, writer)
+                body_data = await _read_body(reader, writer, headers, default=b"")
+                if body_data is not None:
+                    await handle_streamable_post(agent_id, role, headers, body_data, writer)
             else:
                 _write_simple(writer, "405 Method Not Allowed", extra_headers=b"Allow: POST\r\n")
             await writer.drain()
@@ -562,8 +621,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
         # POST /messages (legacy HTTP+SSE message endpoint)
         if method == "POST" and path in ("/messages", "/message", "/rpc"):
-            content_length = int(headers.get("content-length", 0))
-            body_data = await reader.readexactly(content_length) if content_length > 0 else b"{}"
+            body_data = await _read_body(reader, writer, headers, default=b"{}")
+            if body_data is None:
+                await writer.drain()
+                writer.close()
+                return
             try:
                 rpc_body = json.loads(body_data.decode("utf-8"))
             except Exception:
@@ -575,6 +637,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
             session_id = query.get("sessionId", [""])[0]
             target_session = _SESSIONS.get(session_id)
+            if target_session is not None and target_session.agent_id != agent_id:
+                target_session = None  # somebody else's stream: answer on this request instead of pushing into it
 
             rpc_response = await handle_jsonrpc(agent_id, role, rpc_body)
 
@@ -620,14 +684,41 @@ async def _periodic_reconcile_loop():
             print(f"[reconcile] periodic pass failed: {exc}")
 
 
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_background(coro) -> "asyncio.Task":
+    """create_task keeps only a weak reference: hold on to the task or it can be collected mid-run."""
+    task = asyncio.get_running_loop().create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
+def configure_event_loop(loop: "asyncio.AbstractEventLoop") -> None:
+    """
+    Tool calls run in the loop's default executor, which holds min(32, cpu + 4) threads. A hub_shell
+    can run for an hour, so a handful of them used to starve every other call (and the token check).
+    """
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=max(4, config.max_workers), thread_name_prefix="sag"))
+
+
 async def run_server():
+    # Under systemd stdout is a pipe, which Python buffers in blocks: without this the log lines
+    # below (and the reconcile failures) would not show up in the journal until much later.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    configure_event_loop(asyncio.get_running_loop())
     init_db()
     ensure_document()
     try:
         reconcile()
     except Exception as exc:
         print(f"[reconcile] startup pass failed: {exc}")
-    asyncio.create_task(_periodic_reconcile_loop())
+    _spawn_background(_periodic_reconcile_loop())
     server = await asyncio.start_server(handle_client, config.host, config.port)
     print(f"🚀 Server Agents Gateway listening on {config.host}:{config.port} ...")
     print(f"🔄 Periodic reconcile every {max(5, int(config.reconcile_interval_seconds))}s")

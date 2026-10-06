@@ -2,6 +2,7 @@
 Tests for server-agents-gateway v2: open shell, trash, split audit, document overview.
 """
 
+import asyncio
 import contextlib
 import io
 import json
@@ -631,7 +632,8 @@ class TestGatewayV2(unittest.TestCase):
         self.assertTrue(Path(config.db_path).exists())
         import sqlite3 as _sq
 
-        n = _sq.connect(second["backup"]).execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
+        with contextlib.closing(_sq.connect(second["backup"])) as backup_conn:
+            n = backup_conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
         self.assertGreater(n, 0)
         with self.assertRaises(ValueError):
             backup_database(keep=0)
@@ -1849,6 +1851,248 @@ class TestCredentials(unittest.TestCase):
         out, err = run(config.root_admin_agent_id)
         self.assertIn("Issued ROOT ADMIN token", out)
         self.assertEqual(err, "")
+
+
+class TestHttpLayer(unittest.IsolatedAsyncioTestCase):
+    """The hand-written HTTP / JSON-RPC layer, over real sockets."""
+
+    async def asyncSetUp(self):
+        from sag import server
+
+        self.server_mod = server
+        _wipe_db()
+        init_db()
+        self.token = issue_agent_token("test:http", "operator")
+        self.token_b = issue_agent_token("test:other", "operator")
+        self.srv = await asyncio.start_server(server.handle_client, "127.0.0.1", 0)
+        self.port = self.srv.sockets[0].getsockname()[1]
+
+    async def asyncTearDown(self):
+        self.srv.close()  # no wait_closed(): a legacy SSE connection can sit in its keepalive sleep
+        _wipe_db()
+
+    def _raw(self, method, path, body=b"", token="default", headers=None):
+        if token == "default":
+            token = self.token
+        lines = [f"{method} {path} HTTP/1.1", "Host: x", "Accept: application/json"]
+        if token:
+            lines.append(f"Authorization: Bearer {token}")
+        for k, v in (headers or {}).items():
+            lines.append(f"{k}: {v}")
+        if body and "Content-Length" not in (headers or {}) and "Transfer-Encoding" not in (headers or {}):
+            lines.append(f"Content-Length: {len(body)}")
+        return ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+
+    async def _send(self, raw, timeout=5):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        try:
+            writer.write(raw)
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(-1), timeout)
+        finally:
+            writer.close()
+        return data
+
+    @staticmethod
+    def _parse(data):
+        head, _, body = data.partition(b"\r\n\r\n")
+        status = int(head.split(b" ", 2)[1]) if head else 0
+        return status, body
+
+    async def _rpc(self, payload, path="/mcp", token="default"):
+        raw = self._raw("POST", path, json.dumps(payload).encode(), token=token)
+        status, body = self._parse(await self._send(raw))
+        return status, (json.loads(body) if body else None)
+
+    # ---- basics
+
+    async def test_health_needs_no_token_and_other_paths_do(self):
+        status, body = self._parse(await self._send(self._raw("GET", "/health", token=None)))
+        self.assertEqual(status, 200)
+        status, _ = self._parse(await self._send(self._raw("POST", "/mcp", b"{}", token=None)))
+        self.assertEqual(status, 401)
+        status, _ = self._parse(await self._send(self._raw("POST", "/mcp", b"{}", token="sag_nope_" + "0" * 48)))
+        self.assertEqual(status, 401)
+
+    async def test_tools_list_works(self):
+        status, res = await self._rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.assertEqual(status, 200)
+        self.assertIn("hub_shell", [t["name"] for t in res["result"]["tools"]])
+
+    # ---- JSON-RPC robustness
+
+    async def test_null_params_answer_with_an_error_instead_of_dropping_the_connection(self):
+        for method in ("tools/call", "tools/list", "initialize", "ping"):
+            with self.subTest(method=method):
+                status, res = await self._rpc({"jsonrpc": "2.0", "id": 1, "method": method, "params": None})
+                self.assertEqual(status, 200)
+                self.assertEqual(res["id"], 1)
+                if method == "tools/call":
+                    self.assertIn("Unknown MCP tool", res["error"]["message"])
+                else:
+                    self.assertIn("result", res)
+
+    async def test_params_that_are_not_an_object_are_invalid_params(self):
+        for bad in ([], "x", 5, True):
+            with self.subTest(bad=bad):
+                status, res = await self._rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": bad})
+                self.assertEqual(res["error"]["code"], -32602)
+
+    async def test_notification_with_bad_params_gets_no_reply(self):
+        raw = self._raw("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "method": "notifications/x", "params": 5}).encode())
+        status, body = self._parse(await self._send(raw))
+        self.assertEqual(status, 202)
+
+    async def test_arguments_null_is_the_same_as_no_arguments(self):
+        status, res = await self._rpc(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "hub_list_agents", "arguments": None}}
+        )
+        self.assertIn("result", res, res)
+
+    async def test_arguments_of_the_wrong_type_are_an_error_message(self):
+        status, res = await self._rpc(
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "hub_shell", "arguments": [1]}}
+        )
+        self.assertIn("arguments must be an object", res["error"]["message"])
+
+    async def test_a_batch_survives_one_bad_element(self):
+        raw = self._raw("POST", "/mcp", json.dumps([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": None},
+        ]).encode())
+        status, body = self._parse(await self._send(raw))
+        self.assertEqual(status, 200)
+        by_id = {r["id"]: r for r in json.loads(body)}
+        self.assertIn("result", by_id[1])
+        self.assertIn("error", by_id[2])
+
+    async def test_a_bug_inside_a_handler_becomes_an_internal_error(self):
+        with unittest.mock.patch.object(self.server_mod, "get_tools_for_agent", side_effect=RuntimeError("boom")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            status, res = await self._rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/list"})
+        self.assertEqual((status, res["error"]["code"]), (200, -32603))
+        self.assertNotIn("boom", res["error"]["message"])  # details stay in the log
+
+    async def test_legacy_endpoint_answers_a_json_array_or_scalar_instead_of_resetting(self):
+        for body in (b"[1,2]", b"5", b"null", b'"x"'):
+            with self.subTest(body=body):
+                status, resp = self._parse(await self._send(self._raw("POST", "/messages", body)))
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(resp)["error"]["code"], -32600)
+
+    # ---- request framing and limits
+
+    async def test_bad_content_length_values_are_a_400(self):
+        for bad in ("abc", "-5", "1e3", "+5", "5.0", "0x10", "5, 5"):
+            with self.subTest(value=bad):
+                raw = self._raw("POST", "/mcp", b"", headers={"Content-Length": bad})
+                status, _ = self._parse(await self._send(raw))
+                self.assertEqual(status, 400)
+
+    async def test_chunked_bodies_are_refused_with_411(self):
+        raw = self._raw("POST", "/mcp", b"4\r\n{}{}\r\n0\r\n\r\n", headers={"Transfer-Encoding": "chunked"})
+        status, body = self._parse(await self._send(raw))
+        self.assertEqual(status, 411)
+        self.assertIn("Content-Length", json.loads(body)["error"])
+
+    async def test_oversized_bodies_are_refused_before_they_are_read(self):
+        with _config_override(max_request_bytes=100):
+            raw = self._raw("POST", "/mcp", b"", headers={"Content-Length": "101"})
+            status, _ = self._parse(await self._send(raw))
+            self.assertEqual(status, 413)
+            ok = self._raw("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode())
+            self.assertEqual(self._parse(await self._send(ok))[0], 200)
+
+    async def test_a_client_that_never_finishes_its_headers_is_dropped(self):
+        with unittest.mock.patch.object(self.server_mod, "HEADER_TIMEOUT", 0.3):
+            started = time.monotonic()
+            data = await self._send(b"POST /mcp HTTP/1.1\r\nHost: x\r\nAuthor", timeout=3)
+        self.assertEqual(data, b"")
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    async def test_a_client_that_stalls_in_the_body_gets_408(self):
+        with unittest.mock.patch.object(self.server_mod, "BODY_TIMEOUT", 0.3):
+            started = time.monotonic()
+            data = await self._send(self._raw("POST", "/mcp", b"", headers={"Content-Length": "50"}) + b"{}", timeout=3)
+        self.assertEqual(self._parse(data)[0], 408)
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    async def test_a_header_flood_is_refused(self):
+        raw = self._raw("POST", "/mcp", b"", headers={f"X-{i}": "v" for i in range(200)})
+        self.assertEqual(self._parse(await self._send(raw))[0], 431)
+
+    async def test_a_client_hanging_up_mid_body_does_not_break_the_server(self):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(self._raw("POST", "/mcp", b"", headers={"Content-Length": "50"}) + b"{")
+        await writer.drain()
+        writer.close()
+        await asyncio.sleep(0.1)
+        status, _ = self._parse(await self._send(self._raw("GET", "/health", token=None)))
+        self.assertEqual(status, 200)
+
+    # ---- the event loop stays free
+
+    async def test_a_slow_token_check_does_not_freeze_other_connections(self):
+        def slow_auth(header):
+            time.sleep(0.6)
+            return ("test:http", "operator")
+
+        with unittest.mock.patch.object(self.server_mod, "authenticate_bearer_token", slow_auth):
+            slow = asyncio.create_task(self._send(self._raw("POST", "/mcp", b"{}")))
+            await asyncio.sleep(0.1)
+            started = time.monotonic()
+            status, _ = self._parse(await self._send(self._raw("GET", "/health", token=None)))
+            health_latency = time.monotonic() - started
+            await slow
+        self.assertEqual(status, 200)
+        self.assertLess(health_latency, 0.4)
+
+    async def test_many_long_running_calls_do_not_starve_the_pool(self):
+        n = 12
+        barrier = threading.Barrier(n)
+        with _config_override(max_workers=n):
+            self.server_mod.configure_event_loop(asyncio.get_running_loop())
+            # all n calls must be running at the same time to pass the barrier: a smaller default pool would time out
+            await asyncio.gather(*(asyncio.to_thread(barrier.wait, 5) for _ in range(n)))
+
+    # ---- legacy SSE sessions belong to one agent
+
+    async def _open_sse(self, token):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(self._raw("GET", "/sse", token=token))
+        await writer.drain()
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 3)  # response head
+        event = (await asyncio.wait_for(reader.readuntil(b"\n\n"), 3)).decode()
+        session_id = event.split("sessionId=")[1].split()[0]
+        return reader, writer, session_id
+
+    async def test_another_agent_cannot_make_a_response_appear_on_my_sse_stream(self):
+        reader, writer, session_id = await self._open_sse(self.token)
+        try:
+            ping = json.dumps({"jsonrpc": "2.0", "id": 7, "method": "ping"}).encode()
+            status, body = self._parse(
+                await self._send(self._raw("POST", f"/messages?sessionId={session_id}", ping, token=self.token_b))
+            )
+            self.assertEqual(status, 200)  # answered on its own request, not pushed anywhere
+            self.assertEqual(json.loads(body)["id"], 7)
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(reader.readuntil(b"\n\n"), 0.5)
+        finally:
+            writer.close()
+
+    async def test_the_owner_still_gets_its_responses_on_the_stream(self):
+        reader, writer, session_id = await self._open_sse(self.token)
+        try:
+            ping = json.dumps({"jsonrpc": "2.0", "id": 8, "method": "ping"}).encode()
+            status, _ = self._parse(
+                await self._send(self._raw("POST", f"/messages?sessionId={session_id}", ping, token=self.token))
+            )
+            self.assertEqual(status, 202)
+            event = (await asyncio.wait_for(reader.readuntil(b"\n\n"), 3)).decode()
+            self.assertIn("event: message", event)
+            self.assertEqual(json.loads(event.split("data: ", 1)[1])["id"], 8)
+        finally:
+            writer.close()
 
 
 class TestCollab(unittest.TestCase):
