@@ -4,6 +4,7 @@ Supports environment variables and optional .env file.
 """
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,9 +17,16 @@ def _load_env_file(filepath: Path) -> None:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
             key, val = line.split("=", 1)
             key = key.strip()
-            val = val.strip().strip('"').strip("'")
+            val = val.strip()
+            if val[:1] in ('"', "'"):
+                end = val.find(val[0], 1)
+                val = val[1:end] if end != -1 else val[1:]  # quoted: everything inside, '#' included
+            else:
+                val = re.split(r"\s+#", val, maxsplit=1)[0].strip()  # `KEY=4180  # port`
             if key not in os.environ:
                 os.environ[key] = val
 
@@ -67,6 +75,11 @@ class Config:
     audit_body_max_bytes: int = int(os.getenv("GATEWAY_AUDIT_BODY_MAX_BYTES", str(2 * 1024 * 1024)))
     # hub_read_file returns at most this many bytes per call (the caller continues with next_offset)
     read_max_bytes: int = int(os.getenv("GATEWAY_READ_MAX_BYTES", str(2 * 1024 * 1024)))
+    # largest request body the HTTP layer will read (hub_write_file content travels in it)
+    max_request_bytes: int = int(os.getenv("GATEWAY_MAX_REQUEST_BYTES", str(16 * 1024 * 1024)))
+    # threads that run tool calls; every running hub_shell holds one, so this is also the number of
+    # commands that can run at once without starving the quick calls
+    max_workers: int = int(os.getenv("GATEWAY_MAX_WORKERS", "64"))
     trash_retention_days: int = int(os.getenv("GATEWAY_TRASH_RETENTION_DAYS", "30"))
     # backup-db keeps this many gateway.db.bak-* files (newest first)
     db_backup_keep: int = int(os.getenv("GATEWAY_DB_BACKUP_KEEP", "1"))

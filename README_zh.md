@@ -11,7 +11,7 @@
 
 手机上的助手、电脑上的 Claude Code、Cursor、定时任务，都想到同一台 VPS 上干活。给每个 agent 发一把 SSH key 的话，谁执行了什么没有记录，删错了没法撤销，agent 之间也没法配合。
 
-SAG 是跑在这台机器上的一个 MCP 服务。每个 agent 用自己的 token 接入，拿到一个真 shell。每次调用都会记录下来，删掉的文件先进回收站。agent 共享一篇 markdown 写的服务器画像，还能互相发消息、交接任务。
+SAG 是跑在这台机器上的一个 MCP 服务。每个 agent 用自己的 token 接入，拿到一个真 shell。每条命令、每次文件改动、每条消息和任务变更都会记录下来，失败的调用也记，删掉的文件先进回收站。agent 共享一篇 markdown 写的服务器画像，还能互相发消息、交接任务。
 
 单个 Python 进程，只用标准库。版本 **2.1.3**。
 
@@ -59,7 +59,7 @@ phone:assistant  → hub_query_audit_logs  {"limit": 5}
 
 | | 每个 agent 一把 SSH key | SAG |
 | :--- | :--- | :--- |
-| 谁干了什么 | 看 shell 历史，还得它没被清掉 | 每次调用都记：哪个 agent、什么命令、必填的 `reason`、完整 stdout/stderr、文件 diff |
+| 谁干了什么 | 看 shell 历史，还得它没被清掉 | 每条命令、每次文件改动、每次失败的调用都记：哪个 agent、什么命令、必填的 `reason`、完整 stdout/stderr、文件 diff |
 | `rm` 删错了 | 没了 | 进回收站，按 id 还原，保留 30 天 |
 | 这台机器上跑着什么 | 每个 agent 自己重新摸一遍 | 共享一篇 `SERVER_AGENTS.md`，状态区由网关自动刷新 |
 | agent 之间配合 | 在 `/tmp` 里留纸条 | 收件箱、线程、已读回执、任务交接 |
@@ -79,7 +79,7 @@ SAG 面向的是**一台个人服务器，上面跑的都是你信任的 agent**
 
 保留的安全网：
 
-- **审计**：每次调用都写 SQLite（命令、stdout/stderr、diff），可回放；
+- **审计**：每条命令、每次文件改动，以及每次失败的调用都写 SQLite（命令、stdout/stderr、diff），可回放；
 - **回收站**：见上；
 - **脱敏**：token、Bearer 头、常见 API key 进审计前打码（`sag/audit_redact.py`）；
 - **自保**：见上。
@@ -112,9 +112,9 @@ agent 之间要说话（提问、回答、交接、"我改了 X，你看一下 Y
 | 工具 | 作用 |
 | :--- | :--- |
 | `hub_shell` | `bash -lc`，`command` 和 `reason` 必填。命令里直接写的 `rm` 进回收站；子进程和 `/bin/rm` 是真删。输出上限 2MiB。后台任务要重定向输出（`nohup cmd >log 2>&1 &`），否则这次调用会一直等到超时。 |
-| `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | 文本文件。覆盖、局部替换、删除都先把旧版本放进回收站。读文件一次最多返回 2MiB，超出从 `next_offset` 接着读。 |
+| `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | 文本文件。覆盖、局部替换、删除都先把旧版本放进回收站。读文件一次最多返回 2MiB 的整行，超出从 `next_offset` 接着读；管道和设备文件不读。 |
 | `hub_list_dir` / `hub_mkdir` | 列目录；mkdir -p。 |
-| `hub_list_trash` / `hub_restore_file` | 按 id 还原，30 天过期。 |
+| `hub_list_trash` / `hub_restore_file` | 按 id 还原，30 天过期。`overwrite=true` 会覆盖现在的内容（现有内容先进回收站），所以覆盖也能撤销。 |
 | `hub_get_overview` / `hub_rebuild_overview` | 读 `SERVER_AGENTS.md`；rebuild 只刷新状态区。 |
 | `hub_get_status` | 负载、内存、磁盘、失败单元、服务探活。 |
 | `hub_query_audit_logs` / `hub_get_audit_event` | 事件列表 vs 完整的 stdout/stderr/diff。 |
@@ -192,6 +192,8 @@ GATEWAY_SHELL_TIMEOUT_SECONDS=120
 GATEWAY_SHELL_TIMEOUT_MAX=3600
 GATEWAY_AUDIT_BODY_MAX_BYTES=2097152
 GATEWAY_READ_MAX_BYTES=2097152
+GATEWAY_MAX_REQUEST_BYTES=16777216
+GATEWAY_MAX_WORKERS=64
 GATEWAY_TRASH_RETENTION_DAYS=30
 RECONCILE_INTERVAL_SECONDS=60
 ```

@@ -2,7 +2,9 @@
 Tests for server-agents-gateway v2: open shell, trash, split audit, document overview.
 """
 
+import asyncio
 import contextlib
+import io
 import json
 import os
 import shutil
@@ -42,6 +44,7 @@ from sag.db import (
     init_db,
     query_audit_logs,
 )
+from sag.clip import TRUNCATED_MARK, clip_output
 from sag.executor import CommandExecutionError, _Capture, execute_shell
 from sag.overview import (
     STATUS_END,
@@ -75,6 +78,9 @@ from sag.tools_spec import MCP_TOOLS_SPEC
 
 
 def _wipe_db():
+    from sag.reconciler import wait_reconciled
+
+    wait_reconciled(15)  # tool calls start a background refresh; let it finish before its database goes away
     db_p = Path(os.environ["GATEWAY_DB_PATH"])
     for suffix in ("", "-wal", "-shm"):
         p = Path(str(db_p) + suffix) if suffix else db_p
@@ -432,6 +438,155 @@ class TestGatewayV2(unittest.TestCase):
         tool_restore_file("test:agent", items[0]["id"], "restore tree")
         self.assertEqual((d / "n.txt").read_text(encoding="utf-8"), "nested")
 
+    # ---- restore with overwrite
+
+    def test_restore_overwrite_undoes_a_write_in_place_and_is_itself_undoable(self):
+        path = Path(config.shell_cwd) / "conf.txt"
+        path.write_text("v1", encoding="utf-8")
+        inode = path.stat().st_ino
+        written = tool_write_file("test:agent", str(path), "v2", "overwrite")
+        self.assertEqual(tool_restore_file("test:agent", written["trash_id"], "undo")["status"], "FAILED")
+        res = tool_restore_file("test:agent", written["trash_id"], "undo", overwrite=True)
+        self.assertEqual(res["status"], "RESTORED")
+        self.assertEqual(path.read_text(encoding="utf-8"), "v1")
+        self.assertEqual(path.stat().st_ino, inode)  # rewritten in place, like hub_write_file
+        self.assertEqual(len(list_trash()), 1)  # the restored item is gone, the displaced v2 is in
+        again = tool_restore_file("test:agent", res["displaced_trash_id"], "redo", overwrite="true")
+        self.assertEqual(again["status"], "RESTORED")
+        self.assertEqual(path.read_text(encoding="utf-8"), "v2")
+
+    def test_restore_overwrite_replaces_a_directory(self):
+        d = Path(config.shell_cwd) / "tree"
+        d.mkdir()
+        (d / "old.txt").write_text("old", encoding="utf-8")
+        deleted = tool_delete_file("test:agent", str(d), "rm tree")
+        d.mkdir()
+        (d / "new.txt").write_text("new", encoding="utf-8")
+        res = tool_restore_file("test:agent", deleted["trash_id"], "back", overwrite=True)
+        self.assertEqual(res["status"], "RESTORED")
+        self.assertEqual((d / "old.txt").read_text(encoding="utf-8"), "old")
+        self.assertFalse((d / "new.txt").exists())
+        displaced = [i for i in list_trash() if i["id"] == res["displaced_trash_id"]]
+        self.assertTrue(displaced and displaced[0]["is_dir"])
+
+    def test_restore_without_overwrite_still_refuses(self):
+        path = Path(config.shell_cwd) / "a.txt"
+        path.write_text("v1", encoding="utf-8")
+        item_id = trash_put(path, source="delete_file", agent_id="test:agent")
+        path.write_text("v2", encoding="utf-8")
+        self.assertEqual(tool_restore_file("test:agent", item_id, "x", overwrite=False)["status"], "FAILED")
+        self.assertEqual(path.read_text(encoding="utf-8"), "v2")
+
+    # ---- the bin never ends up with orphans or lost rows
+
+    def test_failed_trash_put_leaves_no_orphan_and_keeps_the_file(self):
+        from sag import trash as trash_mod
+
+        path = Path(config.shell_cwd) / "keepme.txt"
+        path.write_text("data", encoding="utf-8")
+        with unittest.mock.patch.object(trash_mod, "_move", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                trash_put(path, source="delete_file", agent_id="test:agent")
+        self.assertEqual(path.read_text(encoding="utf-8"), "data")
+        trash_root = Path(config.db_path).resolve().parent / "trash"
+        self.assertEqual(list(trash_root.iterdir()) if trash_root.exists() else [], [])
+        self.assertEqual(list_trash(), [])
+
+    def test_trash_put_rolls_back_when_the_row_cannot_be_written(self):
+        from sag import trash as trash_mod
+
+        path = Path(config.shell_cwd) / "rollback.txt"
+        path.write_text("data", encoding="utf-8")
+        with unittest.mock.patch.object(trash_mod, "get_db_connection", side_effect=RuntimeError("db locked")):
+            with self.assertRaises(RuntimeError):
+                trash_put(path, source="delete_file", agent_id="test:agent")
+        self.assertEqual(path.read_text(encoding="utf-8"), "data")  # not lost: back where it was
+        trash_root = Path(config.db_path).resolve().parent / "trash"
+        self.assertEqual(list(trash_root.iterdir()) if trash_root.exists() else [], [])
+
+    def test_cross_device_copy_failing_halfway_removes_the_partial_payload(self):
+        import errno as _errno
+
+        from sag import trash as trash_mod
+
+        src = Path(config.shell_cwd) / "tree2"
+        src.mkdir()
+        (src / "f").write_text("x", encoding="utf-8")
+        dst = Path(config.shell_cwd) / "bin" / "payload"
+
+        def half_copy(s_, d_, symlinks=False):
+            Path(d_).mkdir(parents=True)
+            (Path(d_) / "partial").write_text("p", encoding="utf-8")
+            raise OSError(_errno.ENOSPC, "no space")
+
+        with unittest.mock.patch.object(trash_mod.os, "rename", side_effect=OSError(_errno.EXDEV, "cross")), \
+                unittest.mock.patch.object(trash_mod.shutil, "copytree", half_copy):
+            with self.assertRaises(OSError):
+                trash_mod._move(src, dst)
+        self.assertTrue((src / "f").exists())  # the source is untouched
+        self.assertFalse(os.path.lexists(dst))
+
+    def test_expired_item_whose_payload_cannot_be_removed_keeps_its_row(self):
+        from sag import trash as trash_mod
+
+        path = Path(config.shell_cwd) / "stuck.txt"
+        path.write_text("data", encoding="utf-8")
+        item_id = trash_put(path, source="delete_file", agent_id="test:agent")
+        with get_db_connection() as conn:
+            conn.execute("UPDATE trash_items SET expires_at = '2000-01-01T00:00:00+0000' WHERE id = ?;", (item_id,))
+            conn.commit()
+        with unittest.mock.patch.object(trash_mod.shutil, "rmtree", lambda *a, **k: None):
+            self.assertEqual(trash_mod.purge_expired_trash(), 0)
+            self.assertEqual(trash_mod.purge_trash_items([item_id]), 0)
+        self.assertEqual([i["id"] for i in list_trash()], [item_id])  # retried on the next pass
+        self.assertEqual(trash_mod.purge_expired_trash(), 1)
+        self.assertEqual(list_trash(), [])
+
+    # ---- .env
+
+    def test_env_file_accepts_export_inline_comments_and_quotes(self):
+        from sag.config import _load_env_file
+
+        env = Path(config.shell_cwd) / "test.env"
+        env.write_text(
+            "# a comment\n"
+            "SAGT_PORT=4180   # the port\n"
+            "export SAGT_HOST=127.0.0.1\n"
+            "SAGT_QUOTED=\"has # hash\" # trailing\n"
+            "SAGT_SINGLE='it is'\n"
+            "SAGT_URL=http://h/#frag\n"
+            "SAGT_EMPTY=\n"
+            "not a setting\n",
+            encoding="utf-8",
+        )
+        keys = ("SAGT_PORT", "SAGT_HOST", "SAGT_QUOTED", "SAGT_SINGLE", "SAGT_URL", "SAGT_EMPTY")
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            try:
+                _load_env_file(env)
+                self.assertEqual(int(os.environ["SAGT_PORT"]), 4180)
+                self.assertEqual(os.environ["SAGT_HOST"], "127.0.0.1")
+                self.assertEqual(os.environ["SAGT_QUOTED"], "has # hash")
+                self.assertEqual(os.environ["SAGT_SINGLE"], "it is")
+                self.assertEqual(os.environ["SAGT_URL"], "http://h/#frag")  # no whitespace before '#': not a comment
+                self.assertEqual(os.environ["SAGT_EMPTY"], "")
+            finally:
+                for k in keys:
+                    os.environ.pop(k, None)
+
+    def test_env_file_does_not_override_the_real_environment(self):
+        from sag.config import _load_env_file
+
+        env = Path(config.shell_cwd) / "test2.env"
+        env.write_text("SAGT_KEEP=from-file\n", encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ, {"SAGT_KEEP": "from-env"}):
+            _load_env_file(env)
+            self.assertEqual(os.environ["SAGT_KEEP"], "from-env")
+
+    def test_runtime_files_are_gitignored(self):
+        text = (Path(__file__).resolve().parent.parent / ".gitignore").read_text(encoding="utf-8")
+        for name in (".env", "data/", "SERVER_AGENTS.md"):
+            self.assertIn(name, text.split())
+
     def test_audit_redaction_in_shell_log(self):
         tok = "sag_cursor_helm_" + "ab12" * 12
         raw = (
@@ -480,7 +635,8 @@ class TestGatewayV2(unittest.TestCase):
         self.assertTrue(Path(config.db_path).exists())
         import sqlite3 as _sq
 
-        n = _sq.connect(second["backup"]).execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
+        with contextlib.closing(_sq.connect(second["backup"])) as backup_conn:
+            n = backup_conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
         self.assertGreater(n, 0)
         with self.assertRaises(ValueError):
             backup_database(keep=0)
@@ -1114,6 +1270,560 @@ class TestShellOutput(_ScratchCwdMixin, unittest.TestCase):
         self.assertTrue(used)
 
 
+class TestClipAndTrashIds(_ScratchCwdMixin, unittest.TestCase):
+    """Big stdout must not evict stderr; recycle-bin ids must reach the audit row however the command redirects."""
+
+    def test_clip_output_fits_untouched(self):
+        self.assertEqual(clip_output("abc", "de", 5), ("abc", "de", False))
+        self.assertEqual(clip_output("", "", 0), ("", "", False))
+
+    def test_clip_output_keeps_a_stderr_share_when_stdout_is_huge(self):
+        out, err, clipped = clip_output("o" * 5000, "error: boom\n", 1000)
+        self.assertTrue(clipped)
+        self.assertEqual(err, "error: boom\n")  # not truncated, not replaced
+        self.assertTrue(out.endswith(TRUNCATED_MARK))
+        self.assertLessEqual(len(out.encode()) - len(TRUNCATED_MARK) + len(err.encode()), 1000)
+
+    def test_clip_output_stdout_that_exactly_fills_the_budget_does_not_wipe_stderr(self):
+        out, err, clipped = clip_output("o" * 1000, "note\n", 1000)
+        self.assertTrue(clipped)
+        self.assertEqual(err, "note\n")
+
+    def test_clip_output_stdout_gets_what_stderr_does_not_need(self):
+        out, err, clipped = clip_output("o" * 5000, "e" * 10, 1000)
+        self.assertEqual(len(out.encode()) - len(TRUNCATED_MARK), 990)
+
+    def test_clip_output_stderr_is_cut_when_it_is_the_one_that_overflows(self):
+        out, err, clipped = clip_output("fine\n", "e" * 5000, 1000)
+        self.assertEqual(out, "fine\n")
+        self.assertTrue(err.endswith(TRUNCATED_MARK))
+        self.assertEqual(len(err.encode()) - len(TRUNCATED_MARK), 995)
+
+    def test_clip_output_both_overflowing_marks_both_and_never_splits_a_character(self):
+        out, err, clipped = clip_output("\u4f60" * 2000, "\u597d" * 2000, 1000)
+        self.assertTrue(out.endswith(TRUNCATED_MARK) and err.endswith(TRUNCATED_MARK))
+        self.assertNotIn("\ufffd", out + err)
+        body = (out[: -len(TRUNCATED_MARK)] + err[: -len(TRUNCATED_MARK)]).encode()
+        self.assertLessEqual(len(body), 1000)
+        self.assertGreaterEqual(len(err[: -len(TRUNCATED_MARK)].encode()), 120)  # the reserve: 1000 // 8
+
+    def test_error_message_and_timeout_note_survive_a_flood_on_stdout(self):
+        with _config_override(audit_body_max_bytes=1000):
+            result = tool_shell(
+                "test:agent", "echo 'error: it broke' >&2; head -c 50000 /dev/zero | tr '\\0' a", "flood"
+            )
+            self.assertTrue(result["truncated"])
+            self.assertIn("error: it broke", result["stderr"])
+            slow = tool_shell(
+                "test:agent", "head -c 50000 /dev/zero | tr '\\0' a; sleep 30", "flood then hang", timeout_seconds=1
+            )
+        self.assertEqual(slow["exit_code"], -1)
+        self.assertIn("timed out after 1s", slow["stderr"])
+        body = get_audit_event(self._last_shell_event()["id"])
+        self.assertIn("timed out after 1s", body["stderr"])
+
+    def test_trash_ids_survive_big_stdout_and_every_redirection(self):
+        cwd = Path(config.shell_cwd)
+        variants = {
+            "plain": "rm {a} {b}",
+            "big stdout": "rm {a} {b}; head -c 50000 /dev/zero | tr '\\0' o",
+            "stderr to /dev/null": "rm {a} {b} 2>/dev/null",
+            "stderr merged into stdout": "rm {a} {b} 2>&1",
+            "all output discarded": "rm {a} {b} >/dev/null 2>&1",
+        }
+        for name, template in variants.items():
+            with self.subTest(name), _config_override(audit_body_max_bytes=1000):
+                a, b = cwd / f"{abs(hash(name))}_a", cwd / f"{abs(hash(name))}_b"
+                a.write_text("a")
+                b.write_text("b")
+                result = tool_shell("test:agent", template.format(a=a, b=b), name)
+                self.assertFalse(a.exists() or b.exists())
+                self.assertEqual(len(result["trash_ids"]), 2, result)
+                self.assertNotIn("SAG_TRASH", result["stdout"] + result["stderr"])
+                event = self._last_shell_event()
+                self.assertEqual(event["trash_id"], result["trash_ids"][0])
+                self.assertEqual(
+                    json.loads(event["params_json"])["trash_ids"], result["trash_ids"]
+                )
+                self.assertEqual({i["id"] for i in list_trash(limit=200) if i["id"] in result["trash_ids"]},
+                                 set(result["trash_ids"]))
+
+    def test_many_trash_ids_are_never_cut_in_half(self):
+        cwd = Path(config.shell_cwd)
+        for i in range(40):
+            (cwd / f"file_{i:02d}").write_text("x")
+        with _config_override(audit_body_max_bytes=300):
+            result = tool_shell("test:agent", "rm file_*", "many")
+        self.assertEqual(len(result["trash_ids"]), 40)
+        self.assertEqual(len(set(result["trash_ids"])), 40)
+        self.assertTrue(all(len(i) == 36 for i in result["trash_ids"]))
+
+    def test_a_command_cannot_forge_trash_ids(self):
+        cwd = Path(config.shell_cwd)
+        (cwd / "mine").write_text("x")
+        (cwd / "theirs").write_text("x")
+        tool_shell("other:agent", "rm theirs", "someone else deletes")
+        theirs = list_trash()[0]["id"]
+        result = tool_shell(
+            "test:agent",
+            f"echo 00000000-0000-0000-0000-000000000000 >> $SAG_TRASH_FILE; echo {theirs} >> $SAG_TRASH_FILE; "
+            f"echo not-an-id >> $SAG_TRASH_FILE; echo 'SAG_TRASH {theirs}' >&2; rm mine",
+            "forge",
+        )
+        self.assertEqual(len(result["trash_ids"]), 1)
+        self.assertNotIn(theirs, result["trash_ids"])
+        self.assertIn(f"SAG_TRASH {theirs}", result["stderr"])  # plain stderr text: neither parsed nor stripped
+
+    def test_trash_id_file_is_removed_after_every_call(self):
+        import glob
+
+        pattern = os.path.join(tempfile.gettempdir(), "sag-trash-*")
+        before = set(glob.glob(pattern))
+        tool_shell("test:agent", "echo hi", "no rm")
+        with self.assertRaises(CommandExecutionError):
+            tool_shell("test:agent", "   ", "empty")
+        self.assertEqual(set(glob.glob(pattern)), before)
+
+    def test_rm_wrapper_run_by_hand_still_prints_the_id(self):
+        victim = Path(config.shell_cwd) / "by_hand"
+        victim.write_text("x")
+        env = {k: v for k, v in os.environ.items() if k != "SAG_TRASH_FILE"}
+        env["SAG_AGENT_ID"] = "test:agent"
+        proc = subprocess.run(
+            [sys.executable, str(_ROOT / "wrappers" / "rm"), str(victim)], env=env, capture_output=True, text=True
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertRegex(proc.stderr, r"^SAG_TRASH [0-9a-f-]{36}$")
+        self.assertFalse(victim.exists())
+
+    def test_rm_accepts_gnu_long_options(self):
+        cwd = Path(config.shell_cwd)
+        (cwd / "d").mkdir()
+        (cwd / "d" / "f").write_text("x")
+        (cwd / "single").write_text("x")
+        result = tool_shell(
+            "test:agent",
+            "rm --force --recursive --verbose d missing; echo first=$?; rm --force missing; echo second=$?; "
+            "rm --no-preserve-root --one-file-system single; echo third=$?; rm --dir nothere; echo fourth=$?",
+            "long options",
+        )
+        self.assertIn("first=0", result["stdout"])
+        self.assertIn("second=0", result["stdout"])
+        self.assertIn("third=0", result["stdout"])
+        self.assertIn("fourth=1", result["stdout"])  # a missing operand without --force is still an error
+        self.assertFalse((cwd / "d").exists() or (cwd / "single").exists())
+        self.assertEqual(len(result["trash_ids"]), 2)
+
+    def test_rm_still_rejects_options_it_does_not_know(self):
+        result = tool_shell("test:agent", "rm --interactive=always x; echo rc=$?", "unknown option")
+        self.assertIn("rc=1", result["stdout"])
+        self.assertIn("unsupported option --interactive=always", result["stderr"])
+
+    def test_audit_body_also_keeps_stderr_when_stdout_is_huge(self):
+        with _config_override(audit_body_max_bytes=1000):
+            append_audit("test:agent", "hub_shell", "shell_exec", "x", "r", "FAILED",
+                         stdout="o" * 5000, stderr="error: kept\n")
+            body = get_audit_event(self._last_shell_event()["id"])
+        self.assertEqual(body["stderr"], "error: kept\n")
+        self.assertTrue(body["stdout"].endswith(TRUNCATED_MARK))
+
+
+class TestDispatchAudit(_ScratchCwdMixin, unittest.TestCase):
+    """docs/v2.md section 3: every tools/call is audited, whether it succeeds or fails, exactly once."""
+
+    def _call(self, tool, args=None, agent="test:agent", role="operator"):
+        from sag.server import dispatch_tool
+
+        return dispatch_tool(agent, role, tool, args)
+
+    def _rows(self):
+        with get_db_connection() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM audit_events ORDER BY rowid;")]
+
+    def _only_row(self):
+        rows = self._rows()
+        self.assertEqual(len(rows), 1, [(r["tool_name"], r["status"]) for r in rows])
+        return rows[0]
+
+    def test_unknown_tool_is_recorded(self):
+        with self.assertRaisesRegex(ValueError, "Unknown MCP tool: hub_nope"):
+            self._call("hub_nope", {"x": 1})
+        row = self._only_row()
+        self.assertEqual((row["tool_name"], row["status"], row["agent_id"]), ("hub_nope", "REJECTED", "test:agent"))
+        self.assertEqual(json.loads(row["params_json"]), {"x": 1})
+
+    def test_tool_names_that_are_not_strings_do_not_break_the_audit(self):
+        for bad in (None, 5, {"a": 1}, "x" * 500):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self._call(bad, {})
+        self.assertEqual(len(self._rows()), 4)
+        self.assertTrue(all(len(r["tool_name"]) <= 100 for r in self._rows()))
+
+    def test_admin_tool_denied_to_an_operator_looks_unknown_but_is_recorded_as_denied(self):
+        with self.assertRaisesRegex(ValueError, "Unknown MCP tool: hub_issue_agent_token"):
+            self._call("hub_issue_agent_token", {"agent_id": "new:agent"})
+        row = self._only_row()
+        self.assertEqual(row["status"], "REJECTED")
+        self.assertIn("admin-only", get_audit_event(row["id"])["stderr"])
+
+    def test_bad_arguments_are_recorded_with_a_readable_message(self):
+        cases = [
+            ("hub_shell", {"command": "echo hi"}, "missing a required argument: 'reason'"),
+            ("hub_shell", {"command": "echo hi", "reason": "r", "bogus": 1}, "unexpected keyword argument 'bogus'"),
+            ("hub_send_message", {"to": "x", "body": "b", "from": "someone:else"}, "'from' is not accepted"),
+            ("hub_read_file", "not an object", "arguments must be an object"),
+        ]
+        for tool, args, expected in cases:
+            with self.subTest(tool=tool, args=args), self.assertRaisesRegex(ValueError, expected):
+                self._call(tool, args)
+        rows = self._rows()
+        self.assertEqual([r["status"] for r in rows], ["REJECTED"] * len(cases))
+        self.assertEqual(rows[0]["reason"], "")
+
+    def test_none_arguments_are_fine_for_tools_without_required_ones(self):
+        self.assertIn("load", json.dumps(self._call("hub_get_status", None)).lower() + "load")
+        self.assertIsInstance(self._call("hub_list_agents", None), dict)
+
+    def test_unexpected_errors_from_file_tools_are_recorded(self):
+        cwd = Path(config.shell_cwd)
+        (cwd / "plain.txt").write_text("x")
+        with self.assertRaises(OSError):  # the parent of the new file is a regular file
+            self._call("hub_write_file", {"path": str(cwd / "plain.txt" / "child"), "content": "c", "reason": "r"})
+        row = self._only_row()
+        self.assertEqual((row["tool_name"], row["status"]), ("hub_write_file", "FAILED"))
+        self.assertTrue(row["target"].endswith("plain.txt/child"))
+        self.assertEqual(row["reason"], "r")
+        self.assertRegex(get_audit_event(row["id"])["stderr"], r"^(NotADirectoryError|FileExistsError): ")
+
+    def test_bad_values_for_read_file_are_recorded(self):
+        path = Path(config.shell_cwd) / "r.txt"
+        path.write_text("x")
+        with self.assertRaises(ValueError):
+            self._call("hub_read_file", {"path": str(path), "offset": "abc"})
+        self.assertEqual(self._only_row()["status"], "FAILED")
+
+    def test_validation_errors_from_collab_tools_are_recorded(self):
+        with self.assertRaises(ValueError):
+            self._call("hub_send_message", {"to": "nobody:here", "body": "hi"})
+        row = self._only_row()
+        self.assertEqual((row["tool_name"], row["status"]), ("hub_send_message", "FAILED"))
+        self.assertEqual(row["target"], "nobody:here")
+
+    def test_failures_the_tools_already_record_are_not_recorded_twice(self):
+        cwd = Path(config.shell_cwd)
+        scenarios = [
+            ("hub_read_file", {"path": str(cwd / "missing.txt")}),
+            ("hub_list_dir", {"path": str(cwd / "missing")}),
+            ("hub_patch_file", {"path": str(cwd / "missing.txt"), "old_string": "a", "new_string": "b", "reason": "r"}),
+            ("hub_shell", {"command": "   ", "reason": "empty"}),
+            ("hub_shell", {"command": "echo hi", "reason": "r", "timeout_seconds": "soon"}),
+            ("hub_mkdir", {"path": str(Path(config.data_dir) / "x"), "reason": "protected"}),
+            ("hub_read_file", {"path": str(cwd)}),
+        ]
+        for tool, args in scenarios:
+            with self.subTest(tool=tool, args=args):
+                with get_db_connection() as conn:
+                    before = conn.execute("SELECT COUNT(*) AS n FROM audit_events;").fetchone()["n"]
+                with self.assertRaises(Exception):
+                    self._call(tool, args)
+                with get_db_connection() as conn:
+                    after = conn.execute("SELECT COUNT(*) AS n FROM audit_events;").fetchone()["n"]
+                self.assertEqual(after - before, 1)
+
+    def test_permission_errors_are_recorded_as_rejected(self):
+        # the admin check inside the tool is the second line of defence behind the dispatcher's
+        with self.assertRaises(PermissionError):
+            from sag.server import _audit_failure
+
+            try:
+                tool_issue_agent_token(caller_agent_id="test:agent", caller_role="operator", agent_id="x:y")
+            except PermissionError as exc:
+                _audit_failure("test:agent", "hub_issue_agent_token", {"agent_id": "x:y"}, exc)
+                raise
+        row = self._only_row()
+        self.assertEqual((row["status"], row["action_type"]), ("REJECTED", "tool_rejected"))
+
+    def test_big_and_secret_arguments_are_summarised_and_redacted(self):
+        token = "sag_laptop_claude_" + "ab12" * 12
+        with self.assertRaises(Exception):
+            self._call("hub_write_file", {"path": "/proc/nope/x", "content": "A" * 100_000 + token, "reason": "r"})
+        row = self._only_row()
+        params = json.loads(row["params_json"])
+        self.assertLess(len(row["params_json"]), 2000)
+        self.assertIn("chars)", params["content"])
+        self.assertNotIn("ab12ab12", row["params_json"])
+
+    def test_a_failing_audit_write_never_hides_the_real_error(self):
+        err = io.StringIO()
+        with unittest.mock.patch("sag.server.append_audit", side_effect=RuntimeError("db locked")), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaisesRegex(ValueError, "Unknown MCP tool"):
+                self._call("hub_nope")
+        self.assertIn("could not record failed call", err.getvalue())
+
+    def test_rebuild_overview_is_attributed_to_the_caller(self):
+        self._call("hub_rebuild_overview", {"reason": "after a deploy"}, agent="laptop:claude")
+        rows = [r for r in self._rows() if r["tool_name"] == "hub_rebuild_overview"]
+        self.assertEqual([(r["agent_id"], r["reason"]) for r in rows], [("laptop:claude", "after a deploy")])
+
+    def test_shell_result_survives_a_failing_audit_write(self):
+        calls = []
+        def flaky(**kw):
+            calls.append(kw["tool_name"])
+            raise RuntimeError("database is locked")
+
+        err = io.StringIO()
+        with unittest.mock.patch("sag.tools.append_audit", flaky), unittest.mock.patch("sag.tools.time.sleep"), \
+                contextlib.redirect_stderr(err):
+            result = tool_shell("test:agent", "echo ran > proof.txt; echo out", "audit is down")
+        self.assertIn("could not record hub_shell", err.getvalue())
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stdout"], "out\n")
+        self.assertIn("could not be written", result["audit_error"])
+        self.assertEqual((Path(config.shell_cwd) / "proof.txt").read_text(), "ran\n")
+        self.assertEqual(calls, ["hub_shell", "hub_shell"])  # tried twice
+
+    def test_shell_audit_is_retried_once_and_then_no_warning(self):
+        state = {"n": 0}
+        real = append_audit
+
+        def once_locked(**kw):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise RuntimeError("database is locked")
+            return real(**kw)
+
+        with unittest.mock.patch("sag.tools.append_audit", once_locked), unittest.mock.patch("sag.tools.time.sleep"):
+            result = tool_shell("test:agent", "echo hi", "flaky audit")
+        self.assertNotIn("audit_error", result)
+        self.assertEqual(self._only_row()["status"], "SUCCESS")
+
+    def test_query_order_is_stable_within_one_second(self):
+        with unittest.mock.patch("sag.db.time.strftime", return_value="2026-01-01T00:00:00+0000"):
+            for i in range(5):
+                append_audit("test:agent", "hub_shell", "shell_exec", f"cmd{i}", "r", "SUCCESS")
+        self.assertEqual([r["target"] for r in query_audit_logs()], [f"cmd{i}" for i in (4, 3, 2, 1, 0)])
+        self.assertEqual([r["target"] for r in query_audit_logs(limit=2, offset=1)], ["cmd3", "cmd2"])
+
+    def test_trash_listing_order_is_stable_within_one_second(self):
+        cwd = Path(config.shell_cwd)
+        for i in range(4):
+            (cwd / f"t{i}").write_text("x")
+            tool_delete_file("test:agent", str(cwd / f"t{i}"), "r")
+        with get_db_connection() as conn:  # the same second for all of them
+            conn.execute("UPDATE trash_items SET deleted_at = '2026-01-01T00:00:00+0000';")
+            conn.commit()
+        self.assertEqual([Path(i["original_path"]).name for i in list_trash()], ["t3", "t2", "t1", "t0"])
+
+
+class TestReconcile(_ScratchCwdMixin, unittest.TestCase):
+    """The status refresh must not make every tool call wait for slow probes, nor corrupt SERVER_AGENTS.md."""
+
+    INVENTORY = "# h\n\n## Host\n\n## Inventory\n\n" + "".join(
+        f"### svc{i}\n\n- probe: tcp 127.0.0.1:{9000 + i}\n\n" for i in range(6)
+    ) + "## Conventions\n"
+
+    def setUp(self):
+        super().setUp()
+        ov = Path(config.overview_path)
+        if ov.exists():
+            ov.unlink()
+        ensure_document()
+        Path(config.overview_path).write_text(self.INVENTORY, encoding="utf-8")
+
+    def tearDown(self):
+        super().tearDown()
+        ov = Path(config.overview_path)
+        if ov.exists():
+            ov.unlink()
+
+    def test_tool_calls_do_not_wait_for_slow_probes(self):
+        from sag import reconciler
+
+        def slow_probe(kind, spec):
+            time.sleep(1.5)
+            return "up"
+
+        path = Path(config.shell_cwd) / "w.txt"
+        path.write_text("x", encoding="utf-8")
+        with unittest.mock.patch.object(reconciler, "probe_one", slow_probe):
+            trash_id = {}
+            calls = [
+                ("hub_shell", lambda: tool_shell("test:agent", "echo hi", "fast command")),
+                ("hub_write_file", lambda: tool_write_file("test:agent", str(path), "y", "write")),
+                ("hub_patch_file", lambda: tool_patch_file("test:agent", str(path), "y", "z", "patch")),
+                ("hub_delete_file", lambda: trash_id.update(tool_delete_file("test:agent", str(path), "delete"))),
+                ("hub_restore_file", lambda: tool_restore_file("test:agent", trash_id["trash_id"], "restore")),
+                # SERVER_AGENTS.md itself takes a different branch in both tools
+                ("hub_write_file (overview)", lambda: tool_write_file(
+                    "test:agent", config.overview_path, self.INVENTORY, "edit the map")),
+                ("hub_patch_file (overview)", lambda: tool_patch_file(
+                    "test:agent", config.overview_path, "## Conventions", "## Conventions", "edit the map")),
+            ]
+            for name, call in calls:
+                started = time.monotonic()
+                call()
+                elapsed = time.monotonic() - started
+                # waiting for a pass costs at least the 1.5 s of one probe
+                self.assertLess(elapsed, 1.0, f"{name} waited for the status refresh")
+            self.assertTrue(reconciler.wait_reconciled(30))
+        text = read_overview()
+        self.assertEqual(text.count("| up |"), 6, text)
+
+    def test_probes_run_side_by_side(self):
+        from sag import reconciler
+
+        def slow_probe(kind, spec):
+            time.sleep(0.5)
+            return spec
+
+        with unittest.mock.patch.object(reconciler, "probe_one", slow_probe), \
+                unittest.mock.patch.object(reconciler, "list_docker_names", lambda: []):
+            started = time.monotonic()
+            probes, untracked = reconciler.collect_probes_and_untracked()
+            elapsed = time.monotonic() - started
+        self.assertEqual([p["state"] for p in probes], [f"127.0.0.1:{9000 + i}" for i in range(6)])  # order kept
+        self.assertLess(elapsed, 1.6)  # sequentially: 3.0 s
+
+    def test_requests_while_a_pass_is_running_are_coalesced(self):
+        from sag import reconciler
+
+        runs, gate = [], threading.Event()
+
+        def fake_reconcile():
+            runs.append(time.monotonic())
+            gate.wait(5)
+
+        with unittest.mock.patch.object(reconciler, "reconcile", fake_reconcile):
+            reconciler.request_reconcile()
+            deadline = time.monotonic() + 3
+            while not runs and time.monotonic() < deadline:
+                time.sleep(0.01)
+            for _ in range(30):
+                reconciler.request_reconcile()  # all while the first pass is still running
+            gate.set()
+            self.assertTrue(reconciler.wait_reconciled(10))
+        self.assertEqual(len(runs), 2)  # the running pass, plus one follow-up for everything that arrived meanwhile
+
+    def test_a_failing_pass_does_not_wedge_the_worker(self):
+        from sag import reconciler
+
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("probe exploded")
+
+        with unittest.mock.patch.object(reconciler, "reconcile", flaky), contextlib.redirect_stdout(io.StringIO()) as out:
+            reconciler.request_reconcile()
+            self.assertTrue(reconciler.wait_reconciled(10))
+            reconciler.request_reconcile()
+            self.assertTrue(reconciler.wait_reconciled(10))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("background pass failed", out.getvalue())
+
+    def test_rebuild_overview_still_returns_the_refreshed_document(self):
+        from sag import reconciler
+
+        with unittest.mock.patch.object(reconciler, "probe_one", lambda kind, spec: "down"):
+            text = tool_rebuild_overview("check")
+        self.assertEqual(text.count("| down |"), 6)
+
+    def test_overview_readers_and_writers_take_the_document_lock(self):
+        from sag import reconciler
+        from sag.overview import doc_lock, write_handwritten
+
+        attempts = {
+            "read": lambda: read_overview(),
+            "write": lambda: write_handwritten("# edited\n\n## Inventory\n"),
+            "ensure": lambda: ensure_document(),
+        }
+        with unittest.mock.patch.object(reconciler, "probe_one", lambda kind, spec: "up"), \
+                unittest.mock.patch.object(reconciler, "list_docker_names", lambda: []):
+            attempts["refresh"] = reconciler.refresh_status_block
+            for name, action in attempts.items():
+                with self.subTest(name):
+                    done = threading.Event()
+                    with doc_lock:
+                        t = threading.Thread(target=lambda: (action(), done.set()), daemon=True)
+                        t.start()
+                        self.assertFalse(done.wait(0.4), f"{name} did not wait for the lock")
+                    self.assertTrue(done.wait(5), f"{name} never finished")
+                    t.join(2)
+
+    def test_concurrent_readers_never_see_a_half_written_document(self):
+        from sag import reconciler
+        from sag.overview import write_handwritten
+
+        stop = threading.Event()
+        problems = []
+
+        def writer():
+            n = 0
+            while not stop.is_set():
+                n += 1
+                write_handwritten(f"# edit {n}\n\n## Host\n\n## Inventory\n\n## Conventions\n" + "filler\n" * 200)
+
+        def refresher():
+            with unittest.mock.patch.object(reconciler, "list_docker_names", lambda: []):
+                while not stop.is_set():
+                    reconciler.refresh_status_block()
+
+        def reader():
+            while not stop.is_set():
+                text = read_overview()
+                if not text.startswith("#") or "## Inventory" not in text:
+                    problems.append(text[:60])
+
+        threads = [threading.Thread(target=f, daemon=True) for f in (writer, refresher, reader, reader)]
+        for t in threads:
+            t.start()
+        time.sleep(1.5)
+        stop.set()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(problems, [])
+
+    def test_the_http_probe_only_opens_http_urls(self):
+        from sag import reconciler
+
+        with unittest.mock.patch("urllib.request.urlopen") as urlopen:
+            for spec in ("file:///etc/hostname", "ftp://host/x", "gopher://x", "/just/a/path"):
+                self.assertEqual(reconciler.probe_one("http", spec), "unknown", spec)
+            urlopen.assert_not_called()
+
+    def test_http_probe_reports_up_and_down(self):
+        import http.server
+
+        from sag import reconciler
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200 if self.path == "/ok" else 503)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)  # cleanups run last-in first-out: stop serving, then close the socket
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        self.assertEqual(reconciler.probe_one("http", base + "/ok"), "up")
+        self.assertEqual(reconciler.probe_one("http", base + "/bad"), "down")
+
+    def test_untracked_containers_match_whole_names_only(self):
+        inventory = "### shop\n- probe: docker app-db\n\nthe database lives elsewhere, see my.cache.v2\n"
+        names = ["db", "app", "app-db", "cache", "my.cache.v2", "data", "base"]
+        self.assertEqual(
+            untracked_containers(inventory, names),
+            ["docker:db", "docker:app", "docker:cache", "docker:data", "docker:base"],
+        )
+        self.assertEqual(untracked_containers("x (a+b)", ["a+b", "a.b"]), ["docker:a.b"])
+
+
 class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
     """hub_read_file streams the file: bounded memory, line windows, continuation hints."""
 
@@ -1260,44 +1970,371 @@ class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
         self.assertLess(traced["peak"], 3_000_000)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "no named pipes on this platform")
-    def test_one_shot_pipe_is_read_from_its_first_byte(self):
+    def test_named_pipe_is_rejected_instead_of_blocking_a_worker(self):
         fifo = Path(config.shell_cwd) / "pipe"
-        os.mkfifo(fifo)
-
-        def writer():
-            with open(fifo, "wb") as w:
-                w.write(b"first\nsecond\n")
-
-        threading.Thread(target=writer, daemon=True).start()
+        os.mkfifo(fifo)  # nobody ever opens the other end: open() would block forever
         box = {}
 
         def reader():
             try:
                 box["res"] = tool_read_file("test:agent", str(fifo))
-            except Exception as exc:  # pragma: no cover - reported below
+            except Exception as exc:
                 box["exc"] = exc
 
         t = threading.Thread(target=reader, daemon=True)
         t.start()
         t.join(5)
         if t.is_alive():
-            for _ in range(2):  # release whatever is blocked in open(), then fail
-                try:
-                    os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
-                except OSError:
-                    pass
+            os.close(os.open(fifo, os.O_RDWR | os.O_NONBLOCK))  # release the blocked open(), then fail
             t.join(2)
-            self.fail("hub_read_file hung on a pipe that has a writer")
-        self.assertNotIn("exc", box, box.get("exc"))
-        self.assertEqual(box["res"]["content"], "first\nsecond\n")
+            self.fail("hub_read_file blocked on a pipe")
+        self.assertIsInstance(box.get("exc"), ValueError)
+        self.assertIn("not a regular file", str(box["exc"]))
+        self.assertEqual(query_audit_logs(action_type="file_read", limit=1)[0]["status"], "FAILED")
 
-    def test_audit_records_the_truncation(self):
-        path = self._file(self._lines(50))
-        with _config_override(read_max_bytes=100):
-            tool_read_file("test:agent", path)
-        row = query_audit_logs(action_type="file_read", limit=1)[0]
-        self.assertEqual(row["status"], "SUCCESS")
-        self.assertTrue(json.loads(row["params_json"])["truncated"])
+    @unittest.skipUnless(os.path.exists("/dev/zero"), "no /dev/zero")
+    def test_devices_are_rejected(self):
+        with self.assertRaises(ValueError):
+            tool_read_file("test:agent", "/dev/zero")
+
+
+class TestCredentials(unittest.TestCase):
+    def setUp(self):
+        _wipe_db()
+        init_db()
+
+    def tearDown(self):
+        _wipe_db()
+
+    def test_agent_id_format_is_validated_at_issuance(self):
+        for bad in ("", " ", "a b", "ops team:bot", "x,y", "@group", "*", "wsl:*", "a/b", "\u514b\u52b3\u5fb7",
+                    "a" * 65, ":x", "x:", "a::b", "a:b:c:d:e", None, 5):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                issue_agent_token(bad, "operator")
+        for good in ("cron", "laptop:claude", "mobile:xiaoyao", "wsl:red-team.x", "a:b:c", "A_1.2-3"):
+            with self.subTest(good=good):
+                self.assertEqual(authenticate_bearer_token(issue_agent_token(good, "operator"))[0], good)
+
+    def test_online_issuing_rejects_bad_ids_too(self):
+        with self.assertRaises(ValueError):
+            tool_issue_agent_token(
+                caller_agent_id=config.root_admin_agent_id, caller_role="admin", agent_id="two words"
+            )
+        self.assertEqual(
+            [r for r in query_audit_logs(action_type="token_issue")], [], "nothing was issued, nothing to record"
+        )
+
+    def test_tokens_of_unusual_legacy_ids_are_still_redacted(self):
+        from sag.audit_redact import redact_secrets
+
+        secret = "ab12" * 12
+        for agent_id in ("laptop_claude", "\u514b\u52b3\u5fb7", "ops team_bot", "a/b_c", "x,y_z"):
+            with self.subTest(agent_id=agent_id):
+                text = redact_secrets(f"export T=sag_{agent_id}_{secret} # and again: sag_{agent_id}_{secret}")
+                self.assertNotIn(secret, text)
+                self.assertNotIn(secret[:16], text)
+
+    def test_reissuing_changes_the_role(self):
+        issue_agent_token("dup:agent", "operator")
+        self.assertEqual(authenticate_bearer_token(issue_agent_token("dup:agent", "admin")), ("dup:agent", "admin"))
+        self.assertEqual(authenticate_bearer_token(issue_agent_token("dup:agent", "operator")), ("dup:agent", "operator"))
+
+    def test_reissuing_invalidates_the_previous_token(self):
+        old = issue_agent_token("rot:agent", "operator")
+        new = issue_agent_token("rot:agent", "operator")
+        self.assertIsNone(authenticate_bearer_token(old))
+        self.assertIsNotNone(authenticate_bearer_token(new))
+
+    def test_issue_admin_warns_when_the_id_is_not_the_configured_root_admin(self):
+        from sag import server
+
+        def run(agent):
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", ["server.py", "issue-admin", agent]), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                server.main()
+            return out.getvalue(), err.getvalue()
+
+        out, err = run("someone:else")
+        self.assertIn("Issued ROOT ADMIN token", out)
+        self.assertIn("will not see them", err)
+        self.assertIn(config.root_admin_agent_id, err)
+        out, err = run(config.root_admin_agent_id)
+        self.assertIn("Issued ROOT ADMIN token", out)
+        self.assertEqual(err, "")
+
+
+class TestHttpLayer(unittest.IsolatedAsyncioTestCase):
+    """The hand-written HTTP / JSON-RPC layer, over real sockets."""
+
+    async def asyncSetUp(self):
+        from sag import server
+
+        self.server_mod = server
+        _wipe_db()
+        init_db()
+        self.token = issue_agent_token("test:http", "operator")
+        self.token_b = issue_agent_token("test:other", "operator")
+        self.srv = await asyncio.start_server(server.handle_client, "127.0.0.1", 0)
+        self.port = self.srv.sockets[0].getsockname()[1]
+
+    async def asyncTearDown(self):
+        self.srv.close()  # no wait_closed(): a legacy SSE connection can sit in its keepalive sleep
+        _wipe_db()
+
+    def _raw(self, method, path, body=b"", token="default", headers=None):
+        if token == "default":
+            token = self.token
+        lines = [f"{method} {path} HTTP/1.1", "Host: x", "Accept: application/json"]
+        if token:
+            lines.append(f"Authorization: Bearer {token}")
+        for k, v in (headers or {}).items():
+            lines.append(f"{k}: {v}")
+        if body and "Content-Length" not in (headers or {}) and "Transfer-Encoding" not in (headers or {}):
+            lines.append(f"Content-Length: {len(body)}")
+        return ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+
+    async def _send(self, raw, timeout=5):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        try:
+            writer.write(raw)
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(-1), timeout)
+        finally:
+            writer.close()
+        return data
+
+    @staticmethod
+    def _parse(data):
+        head, _, body = data.partition(b"\r\n\r\n")
+        status = int(head.split(b" ", 2)[1]) if head else 0
+        return status, body
+
+    async def _rpc(self, payload, path="/mcp", token="default"):
+        raw = self._raw("POST", path, json.dumps(payload).encode(), token=token)
+        status, body = self._parse(await self._send(raw))
+        return status, (json.loads(body) if body else None)
+
+    # ---- basics
+
+    async def test_health_needs_no_token_and_other_paths_do(self):
+        status, body = self._parse(await self._send(self._raw("GET", "/health", token=None)))
+        self.assertEqual(status, 200)
+        status, _ = self._parse(await self._send(self._raw("POST", "/mcp", b"{}", token=None)))
+        self.assertEqual(status, 401)
+        status, _ = self._parse(await self._send(self._raw("POST", "/mcp", b"{}", token="sag_nope_" + "0" * 48)))
+        self.assertEqual(status, 401)
+
+    async def test_tools_list_works(self):
+        status, res = await self._rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.assertEqual(status, 200)
+        self.assertIn("hub_shell", [t["name"] for t in res["result"]["tools"]])
+
+    # ---- JSON-RPC robustness
+
+    async def test_null_params_answer_with_an_error_instead_of_dropping_the_connection(self):
+        for method in ("tools/call", "tools/list", "initialize", "ping"):
+            with self.subTest(method=method):
+                status, res = await self._rpc({"jsonrpc": "2.0", "id": 1, "method": method, "params": None})
+                self.assertEqual(status, 200)
+                self.assertEqual(res["id"], 1)
+                if method == "tools/call":
+                    self.assertIn("Unknown MCP tool", res["error"]["message"])
+                else:
+                    self.assertIn("result", res)
+
+    async def test_params_that_are_not_an_object_are_invalid_params(self):
+        for bad in ([], "x", 5, True):
+            with self.subTest(bad=bad):
+                status, res = await self._rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": bad})
+                self.assertEqual(res["error"]["code"], -32602)
+
+    async def test_notification_with_bad_params_gets_no_reply(self):
+        raw = self._raw("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "method": "notifications/x", "params": 5}).encode())
+        status, body = self._parse(await self._send(raw))
+        self.assertEqual(status, 202)
+
+    async def test_arguments_null_is_the_same_as_no_arguments(self):
+        status, res = await self._rpc(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "hub_list_agents", "arguments": None}}
+        )
+        self.assertIn("result", res, res)
+
+    async def test_arguments_of_the_wrong_type_are_an_error_message(self):
+        status, res = await self._rpc(
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "hub_shell", "arguments": [1]}}
+        )
+        self.assertIn("arguments must be an object", res["error"]["message"])
+
+    async def test_a_batch_survives_one_bad_element(self):
+        raw = self._raw("POST", "/mcp", json.dumps([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": None},
+        ]).encode())
+        status, body = self._parse(await self._send(raw))
+        self.assertEqual(status, 200)
+        by_id = {r["id"]: r for r in json.loads(body)}
+        self.assertIn("result", by_id[1])
+        self.assertIn("error", by_id[2])
+
+    async def test_a_bug_inside_a_handler_becomes_an_internal_error(self):
+        with unittest.mock.patch.object(self.server_mod, "get_tools_for_agent", side_effect=RuntimeError("boom")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            status, res = await self._rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/list"})
+        self.assertEqual((status, res["error"]["code"]), (200, -32603))
+        self.assertNotIn("boom", res["error"]["message"])  # details stay in the log
+
+    async def test_legacy_endpoint_answers_a_json_array_or_scalar_instead_of_resetting(self):
+        for body in (b"[1,2]", b"5", b"null", b'"x"'):
+            with self.subTest(body=body):
+                status, resp = self._parse(await self._send(self._raw("POST", "/messages", body)))
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(resp)["error"]["code"], -32600)
+
+    # ---- request framing and limits
+
+    async def test_bad_content_length_values_are_a_400(self):
+        for bad in ("abc", "-5", "1e3", "+5", "5.0", "0x10", "5, 5"):
+            with self.subTest(value=bad):
+                raw = self._raw("POST", "/mcp", b"", headers={"Content-Length": bad})
+                status, _ = self._parse(await self._send(raw))
+                self.assertEqual(status, 400)
+
+    async def test_chunked_bodies_are_refused_with_411(self):
+        raw = self._raw("POST", "/mcp", b"4\r\n{}{}\r\n0\r\n\r\n", headers={"Transfer-Encoding": "chunked"})
+        status, body = self._parse(await self._send(raw))
+        self.assertEqual(status, 411)
+        self.assertIn("Content-Length", json.loads(body)["error"])
+
+    async def test_oversized_bodies_are_refused_before_they_are_read(self):
+        with _config_override(max_request_bytes=100):
+            raw = self._raw("POST", "/mcp", b"", headers={"Content-Length": "101"})
+            status, _ = self._parse(await self._send(raw))
+            self.assertEqual(status, 413)
+            ok = self._raw("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode())
+            self.assertEqual(self._parse(await self._send(ok))[0], 200)
+
+    async def test_a_client_that_never_finishes_its_headers_is_dropped(self):
+        with unittest.mock.patch.object(self.server_mod, "HEADER_TIMEOUT", 0.3):
+            started = time.monotonic()
+            data = await self._send(b"POST /mcp HTTP/1.1\r\nHost: x\r\nAuthor", timeout=3)
+        self.assertEqual(data, b"")
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    async def test_a_client_that_stalls_in_the_body_gets_408(self):
+        with unittest.mock.patch.object(self.server_mod, "BODY_TIMEOUT", 0.3):
+            started = time.monotonic()
+            data = await self._send(self._raw("POST", "/mcp", b"", headers={"Content-Length": "50"}) + b"{}", timeout=3)
+        self.assertEqual(self._parse(data)[0], 408)
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    async def test_a_header_flood_is_refused(self):
+        raw = self._raw("POST", "/mcp", b"", headers={f"X-{i}": "v" for i in range(200)})
+        self.assertEqual(self._parse(await self._send(raw))[0], 431)
+
+    async def test_a_client_hanging_up_mid_body_does_not_break_the_server(self):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(self._raw("POST", "/mcp", b"", headers={"Content-Length": "50"}) + b"{")
+        await writer.drain()
+        writer.close()
+        await asyncio.sleep(0.1)
+        status, _ = self._parse(await self._send(self._raw("GET", "/health", token=None)))
+        self.assertEqual(status, 200)
+
+    # ---- the event loop stays free
+
+    async def test_a_slow_token_check_does_not_freeze_other_connections(self):
+        import socket
+
+        def slow_auth(header):
+            time.sleep(0.8)
+            return ("test:http", "operator")
+
+        latency = {}
+
+        def probe_from_another_thread():
+            time.sleep(0.2)  # the slow request is inside its token check by now
+            started = time.monotonic()
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+                sock.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                sock.recv(4096)
+            latency["health"] = time.monotonic() - started
+
+        with unittest.mock.patch.object(self.server_mod, "authenticate_bearer_token", slow_auth):
+            probe = asyncio.get_running_loop().run_in_executor(None, probe_from_another_thread)
+            await self._send(self._raw("POST", "/mcp", b"{}"))
+            await probe
+        # a token check on the event loop itself would make this wait for the rest of its 0.8 s
+        self.assertLess(latency["health"], 0.4)
+
+    async def test_many_long_running_calls_do_not_starve_the_pool(self):
+        n = 12
+        barrier = threading.Barrier(n)
+        with _config_override(max_workers=n):
+            self.server_mod.configure_event_loop(asyncio.get_running_loop())
+            # all n calls must be running at the same time to pass the barrier: a smaller default pool would time out
+            await asyncio.gather(*(asyncio.to_thread(barrier.wait, 5) for _ in range(n)))
+
+    async def test_run_server_configures_the_loop_and_holds_on_to_its_background_task(self):
+        server = self.server_mod
+
+        class Stop(Exception):
+            pass
+
+        before = set(server._BACKGROUND_TASKS)
+        try:
+            with unittest.mock.patch.object(server, "configure_event_loop") as configure, \
+                    unittest.mock.patch.object(server, "init_db"), \
+                    unittest.mock.patch.object(server, "ensure_document"), \
+                    unittest.mock.patch.object(server, "reconcile"), \
+                    unittest.mock.patch.object(server.asyncio, "start_server", side_effect=Stop):
+                with self.assertRaises(Stop):
+                    await server.run_server()
+            configure.assert_called_once()
+            held = set(server._BACKGROUND_TASKS) - before
+            self.assertEqual(len(held), 1)  # asyncio only keeps a weak reference to a task
+        finally:
+            for task in list(server._BACKGROUND_TASKS - before):
+                task.cancel()
+
+    # ---- legacy SSE sessions belong to one agent
+
+    async def _open_sse(self, token):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(self._raw("GET", "/sse", token=token))
+        await writer.drain()
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 3)  # response head
+        event = (await asyncio.wait_for(reader.readuntil(b"\n\n"), 3)).decode()
+        session_id = event.split("sessionId=")[1].split()[0]
+        return reader, writer, session_id
+
+    async def test_another_agent_cannot_make_a_response_appear_on_my_sse_stream(self):
+        reader, writer, session_id = await self._open_sse(self.token)
+        try:
+            ping = json.dumps({"jsonrpc": "2.0", "id": 7, "method": "ping"}).encode()
+            status, body = self._parse(
+                await self._send(self._raw("POST", f"/messages?sessionId={session_id}", ping, token=self.token_b))
+            )
+            self.assertEqual(status, 200)  # answered on its own request, not pushed anywhere
+            self.assertEqual(json.loads(body)["id"], 7)
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(reader.readuntil(b"\n\n"), 0.5)
+        finally:
+            writer.close()
+
+    async def test_the_owner_still_gets_its_responses_on_the_stream(self):
+        reader, writer, session_id = await self._open_sse(self.token)
+        try:
+            ping = json.dumps({"jsonrpc": "2.0", "id": 8, "method": "ping"}).encode()
+            status, _ = self._parse(
+                await self._send(self._raw("POST", f"/messages?sessionId={session_id}", ping, token=self.token))
+            )
+            self.assertEqual(status, 202)
+            event = (await asyncio.wait_for(reader.readuntil(b"\n\n"), 3)).decode()
+            self.assertIn("event: message", event)
+            self.assertEqual(json.loads(event.split("data: ", 1)[1])["id"], 8)
+        finally:
+            writer.close()
 
 
 class TestCollab(unittest.TestCase):

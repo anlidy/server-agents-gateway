@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
+from .clip import TRUNCATED_MARK as _TRUNCATED_MARK, clip_output  # noqa: F401  (re-exported)
 from .config import config
 
 
@@ -22,22 +23,8 @@ class CommandExecutionError(Exception):
 
 
 _READ_CHUNK = 64 * 1024
-_TRUNCATED_MARK = "\n[truncated]\n"
 # After the group is killed, how long to keep reading for EOF before giving up on the pipes.
 _KILL_DRAIN_SECONDS = 1.0
-
-
-def clip_output(stdout: str, stderr: str, max_bytes: int) -> Tuple[str, str, bool]:
-    out_b = (stdout or "").encode("utf-8")
-    err_b = (stderr or "").encode("utf-8")
-    if len(out_b) + len(err_b) <= max_bytes:
-        return stdout or "", stderr or "", False
-    if len(out_b) >= max_bytes:
-        cut = out_b[:max_bytes].decode("utf-8", errors="ignore") + "\n[truncated]\n"
-        return cut, "\n[truncated]\n", True
-    remain = max_bytes - len(out_b)
-    cut_err = err_b[:remain].decode("utf-8", errors="ignore") + "\n[truncated]\n"
-    return stdout or "", cut_err, True
 
 
 class _Capture:
@@ -143,6 +130,7 @@ def execute_shell(
     cwd: Optional[str] = None,
     timeout_seconds: Optional[int] = None,
     agent_id: str = "",
+    trash_file: Optional[str] = None,
 ) -> Tuple[int, str, str, bool]:
     cmd = (command or "").strip()
     if not cmd:
@@ -159,6 +147,10 @@ def execute_shell(
     abs_rm = Path(config.wrappers_dir).resolve() / "rm"
     if agent_id:
         env["SAG_AGENT_ID"] = agent_id
+    if trash_file:
+        # The rm wrapper appends the id of everything it moves into the recycle bin to this file,
+        # so ids reach the audit row whatever the command does with stdout and stderr.
+        env["SAG_TRASH_FILE"] = trash_file
     # Only `rm` typed in this command line goes to the recycle bin: rm() lives in
     # this one shell and is NOT exported, and the wrapper is NOT put on PATH.
     # Child processes (dpkg maintainer scripts, make, installers, xargs, find

@@ -8,7 +8,10 @@ import codecs
 import difflib
 import json
 import os
+import re
 import stat
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,10 +20,10 @@ _LIST_DIR_MAX = 2000
 
 from .auth import issue_agent_token, revoke_agent_token
 from .config import config
-from .db import append_audit, get_audit_event, query_audit_logs
+from .db import append_audit, get_audit_event, get_db_connection, query_audit_logs
 from .executor import CommandExecutionError, execute_shell
 from .overview import overview_path, read_overview, select_sections, write_handwritten
-from .reconciler import collect_host_status, reconcile
+from .reconciler import collect_host_status, reconcile, request_reconcile
 from .trash import ProtectedPathError, is_protected, lexical_path, list_trash, restore_trash, trash_put
 
 
@@ -35,20 +38,39 @@ def _audit_then_raise(agent_id, tool_name, action_type, target, reason, status, 
         stderr=str(exc),
         **kwargs,
     )
+    exc.sag_audited = True  # the dispatcher must not record this call a second time
     raise exc
 
 
-def _extract_trash_ids(stderr: str) -> tuple[str, List[str]]:
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _read_trash_ids(path: str, agent_id: str) -> List[str]:
+    """
+    Ids the rm wrapper reported for this command, in order. Only ids that really are this agent's
+    rm_wrapper items in the bin count, so a command cannot make the audit row point at anything else.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            candidates = [ln.strip() for ln in f.read().splitlines()]
+    except OSError:
+        return []
     ids: List[str] = []
-    keep: List[str] = []
-    for line in (stderr or "").splitlines(True):
-        if line.startswith("SAG_TRASH "):
-            token = line.split()[1].strip() if len(line.split()) > 1 else ""
-            if token:
-                ids.append(token)
-        else:
-            keep.append(line)
-    return "".join(keep), ids
+    for c in candidates:
+        if _UUID_RE.match(c) and c not in ids:
+            ids.append(c)
+    if not ids:
+        return []
+    with get_db_connection() as conn:
+        known = {
+            r["id"]
+            for r in conn.execute(
+                f"SELECT id FROM trash_items WHERE source = 'rm_wrapper' AND deleted_by = ? "
+                f"AND id IN ({','.join('?' * len(ids))});",
+                (agent_id, *ids),
+            )
+        }
+    return [i for i in ids if i in known]
 
 
 def tool_shell(
@@ -60,45 +82,55 @@ def tool_shell(
 ) -> Dict[str, Any]:
     start = time.time()
     code, stdout, stderr, truncated = -1, "", "", False
+    trash_fd, trash_file = tempfile.mkstemp(prefix="sag-trash-")
+    os.close(trash_fd)
     try:
-        code, stdout, stderr, truncated = execute_shell(
-            command, cwd=cwd, timeout_seconds=timeout_seconds, agent_id=agent_id
-        )
-    except CommandExecutionError as exc:
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_shell",
-            action_type="shell_exec",
-            target=(command or "")[:200],
-            reason=reason,
-            status="REJECTED",
-            params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
-            stderr=str(exc),
-        )
-        raise
-    except Exception as exc:
-        # Anything else (spawn failure, bad arguments, a bug) still leaves a trace: every call is audited.
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_shell",
-            action_type="shell_exec",
-            target=str(command or "")[:200],
-            reason=reason,
-            status="ERROR",
-            params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
-            stderr=f"{type(exc).__name__}: {exc}",
-        )
-        raise
+        try:
+            code, stdout, stderr, truncated = execute_shell(
+                command, cwd=cwd, timeout_seconds=timeout_seconds, agent_id=agent_id, trash_file=trash_file
+            )
+        except CommandExecutionError as exc:
+            append_audit(
+                agent_id=agent_id,
+                tool_name="hub_shell",
+                action_type="shell_exec",
+                target=(command or "")[:200],
+                reason=reason,
+                status="REJECTED",
+                params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
+                stderr=str(exc),
+            )
+            exc.sag_audited = True
+            raise
+        except Exception as exc:
+            # Anything else (spawn failure, bad arguments, a bug) still leaves a trace: every call is audited.
+            append_audit(
+                agent_id=agent_id,
+                tool_name="hub_shell",
+                action_type="shell_exec",
+                target=str(command or "")[:200],
+                reason=reason,
+                status="ERROR",
+                params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
+                stderr=f"{type(exc).__name__}: {exc}",
+            )
+            exc.sag_audited = True
+            raise
+        finally:
+            try:
+                request_reconcile()
+            except Exception:
+                pass
+        trash_ids = _read_trash_ids(trash_file, agent_id)
     finally:
         try:
-            reconcile()
-        except Exception:
+            os.unlink(trash_file)
+        except OSError:
             pass
-    stderr, trash_ids = _extract_trash_ids(stderr)
     duration_ms = int((time.time() - start) * 1000)
     status = "SUCCESS" if code == 0 else "FAILED"
     workdir = cwd or config.shell_cwd
-    append_audit(
+    audit_kwargs = dict(
         agent_id=agent_id,
         tool_name="hub_shell",
         action_type="shell_exec",
@@ -118,7 +150,7 @@ def tool_shell(
         stdout=stdout,
         stderr=stderr,
     )
-    return {
+    result: Dict[str, Any] = {
         "cwd": workdir,
         "exit_code": code,
         "stdout": stdout,
@@ -127,6 +159,19 @@ def tool_shell(
         "duration_ms": duration_ms,
         "trash_ids": trash_ids,
     }
+    # The command has run. If the audit row cannot be written (database locked, disk full) the result must
+    # still reach the caller, or it will think nothing happened and run the command again; say so instead.
+    for attempt in (1, 2):
+        try:
+            append_audit(**audit_kwargs)
+            break
+        except Exception as exc:
+            if attempt == 2:
+                print(f"[audit] could not record hub_shell for {agent_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+                result["audit_error"] = f"the command ran, but its audit row could not be written: {exc}"
+            else:
+                time.sleep(0.2)
+    return result
 
 
 _SKIP_CHUNK = 64 * 1024
@@ -186,23 +231,20 @@ def tool_read_file(
 ) -> Dict[str, Any]:
     target = Path(path).resolve()
     if not target.exists():
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_read_file",
-            action_type="file_read",
-            target=str(target),
-            reason="",
-            status="FAILED",
+        _audit_then_raise(
+            agent_id, "hub_read_file", "file_read", target, "", "FAILED", FileNotFoundError(str(target))
         )
-        raise FileNotFoundError(str(target))
     if target.is_dir():
         exc = IsADirectoryError(str(target))
+        _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
+    if not stat.S_ISREG(target.stat().st_mode):
+        # A named pipe without a writer would block this worker thread forever, /dev/zero never ends.
+        exc = ValueError(f"not a regular file: {target} (use hub_shell for pipes and devices)")
         _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
     start = max(int(offset) - 1, 0)
     max_lines = None if limit is None else max(int(limit), 0)
     cap = max(1, config.read_max_bytes)
-    # One open, and peek() instead of read() for the binary check: it consumes nothing, so a
-    # pipe or other one-shot file is still read from its first byte.
+    # One open, and peek() for the binary check: it consumes nothing.
     with open(target, "rb") as f:
         binary = b"\x00" in f.peek(8192)[:8192]
         window = None if binary else _read_window(f, start, max_lines, cap)
@@ -256,15 +298,9 @@ def tool_read_file(
 def tool_list_dir(agent_id: str, path: str) -> Dict[str, Any]:
     target = Path(path).resolve()
     if not target.exists():
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_list_dir",
-            action_type="dir_list",
-            target=str(target),
-            reason="",
-            status="FAILED",
+        _audit_then_raise(
+            agent_id, "hub_list_dir", "dir_list", target, "", "FAILED", FileNotFoundError(str(target))
         )
-        raise FileNotFoundError(str(target))
     if not target.is_dir():
         exc = NotADirectoryError(str(target))
         _audit_then_raise(agent_id, "hub_list_dir", "dir_list", target, "", "FAILED", exc)
@@ -356,15 +392,9 @@ def tool_patch_file(
         exc = ValueError("old_string must not be empty")
         _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
     if not target.exists():
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_patch_file",
-            action_type="file_patch",
-            target=str(target),
-            reason=reason,
-            status="FAILED",
+        _audit_then_raise(
+            agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", FileNotFoundError(str(target))
         )
-        raise FileNotFoundError(str(target))
     if target.is_dir():
         exc = IsADirectoryError(str(target))
         _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
@@ -392,7 +422,7 @@ def tool_patch_file(
     else:
         target.write_text(new, encoding="utf-8")
     try:
-        reconcile()
+        request_reconcile()
     except Exception:
         pass
     diff_lines = list(
@@ -447,13 +477,13 @@ def tool_write_file(agent_id: str, path: str, content: str, reason: str) -> Dict
     if target.resolve() == overview_path().resolve():
         write_handwritten(content)
         try:
-            reconcile()
+            request_reconcile()
         except Exception:
             pass
     else:
         target.write_text(content, encoding="utf-8")
         try:
-            reconcile()
+            request_reconcile()
         except Exception:
             pass
     diff_lines = list(
@@ -520,7 +550,7 @@ def _delete_one(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
         return {"path": str(target), "status": "NOT_FOUND"}
     trash_id = trash_put(target, source="delete_file", agent_id=agent_id)
     try:
-        reconcile()
+        request_reconcile()
     except Exception:
         pass
     append_audit(
@@ -549,8 +579,10 @@ def tool_list_trash(agent_id: str, prefix: Optional[str] = None, limit: int = 50
     return items
 
 
-def tool_restore_file(agent_id: str, trash_id: str, reason: str) -> Dict[str, Any]:
-    result = restore_trash(trash_id)
+def tool_restore_file(agent_id: str, trash_id: str, reason: str, overwrite: Any = False) -> Dict[str, Any]:
+    if isinstance(overwrite, str):  # some clients send booleans as strings
+        overwrite = overwrite.strip().lower() in ("1", "true", "yes", "y", "on")
+    result = restore_trash(trash_id, overwrite=bool(overwrite), agent_id=agent_id)
     status = "SUCCESS" if result.get("status") == "RESTORED" else "FAILED"
     append_audit(
         agent_id=agent_id,
@@ -563,7 +595,7 @@ def tool_restore_file(agent_id: str, trash_id: str, reason: str) -> Dict[str, An
         params=result,
     )
     try:
-        reconcile()
+        request_reconcile()
     except Exception:
         pass
     return result
@@ -577,10 +609,10 @@ def tool_get_overview(section: Optional[str] = None) -> str:
     return select_sections(text, section) if section and section.strip() else text
 
 
-def tool_rebuild_overview(reason: str = "refresh status") -> str:
+def tool_rebuild_overview(reason: str = "refresh status", agent_id: str = "system") -> str:
     reconcile()
     append_audit(
-        agent_id="system",
+        agent_id=agent_id,
         tool_name="hub_rebuild_overview",
         action_type="overview_rebuild",
         target="SERVER_AGENTS.md",

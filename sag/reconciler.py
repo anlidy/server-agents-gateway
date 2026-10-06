@@ -7,12 +7,15 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from .config import config
 from .overview import (
+    doc_lock,
     ensure_document,
     overview_path,
     parse_probes,
@@ -54,6 +57,9 @@ def probe_one(kind: str, spec: str) -> str:
             import urllib.error
             import urllib.request
 
+            if not spec.lower().startswith(("http://", "https://")):
+                return "unknown"  # urlopen would also happily open file:// and ftp:// from the inventory
+
             req = urllib.request.Request(
                 spec, method="GET", headers={"User-Agent": "sag-probe/2"}
             )
@@ -88,13 +94,19 @@ def list_docker_names() -> List[str]:
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
 
+_PROBE_WORKERS = 8
+
+
 def collect_probes_and_untracked() -> Tuple[List[Dict[str, str]], List[str]]:
     text = read_overview()
-    probes = []
-    for p in parse_probes(text):
-        state = probe_one(p["kind"], p["spec"])
-        probes.append({**p, "state": state})
-    names = list_docker_names()
+    wanted = parse_probes(text)
+    # Each probe may take up to its 3 s timeout: run them side by side, so a few dead services cost
+    # 3 s in total, not 3 s each.
+    with ThreadPoolExecutor(max_workers=max(1, min(_PROBE_WORKERS, len(wanted) + 1))) as pool:
+        names_future = pool.submit(list_docker_names)
+        futures = [pool.submit(probe_one, p["kind"], p["spec"]) for p in wanted]
+        probes = [{**p, "state": f.result()} for p, f in zip(wanted, futures)]
+        names = names_future.result()
     untracked = untracked_containers(text, names)
     return probes, untracked
 
@@ -124,8 +136,9 @@ def refresh_status_block() -> None:
     probes, untracked = collect_probes_and_untracked()
     inner = render_status_inner(probes, untracked, probed_at)
     path = overview_path()
-    text = path.read_text(encoding="utf-8") if path.exists() else ""
-    path.write_text(replace_status_block(text, inner), encoding="utf-8")
+    with doc_lock:  # probes (slow) are done; only the read-modify-write is serialized
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        path.write_text(replace_status_block(text, inner), encoding="utf-8")
 
 
 def _meminfo_mb() -> Tuple[Dict[str, int], Dict[str, int]]:
@@ -267,3 +280,54 @@ def reconcile() -> None:
 # Back-compat name used by older server.py if mixed
 def reconcile_observed_state():
     reconcile()
+
+
+# --- tool calls ask for a refresh; they do not wait for it -------------------------------------
+# reconcile() probes every service in the inventory (up to 3 s each) and used to run inside every
+# hub_shell / write / patch / delete / restore call: `echo hi` took as long as the slowest probe.
+# Now the call returns at once and one background worker refreshes. Requests that arrive while it
+# is busy are coalesced into a single follow-up pass.
+_async_lock = threading.Lock()
+_async_running = False
+_async_dirty = False
+_async_idle = threading.Event()
+_async_idle.set()
+
+
+def _reconcile_worker() -> None:
+    global _async_running, _async_dirty
+    while True:
+        try:
+            reconcile()
+        except BaseException as exc:  # the worker must never die and leave _async_running stuck
+            print(f"[reconcile] background pass failed: {exc}")
+        with _async_lock:
+            if _async_dirty:
+                _async_dirty = False
+                continue
+            _async_running = False
+            _async_idle.set()
+            return
+
+
+def request_reconcile() -> None:
+    """Refresh the status block and purge expired trash soon, without making the caller wait."""
+    global _async_running, _async_dirty
+    with _async_lock:
+        if _async_running:
+            _async_dirty = True
+            return
+        _async_running = True
+        _async_idle.clear()
+    try:
+        threading.Thread(target=_reconcile_worker, name="sag-reconcile", daemon=True).start()
+    except BaseException:
+        with _async_lock:
+            _async_running = False
+            _async_idle.set()
+        raise
+
+
+def wait_reconciled(timeout: float = 30.0) -> bool:
+    """Block until no background refresh is running (for shutdown and tests). False on timeout."""
+    return _async_idle.wait(timeout)
