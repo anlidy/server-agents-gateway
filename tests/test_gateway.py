@@ -1641,20 +1641,31 @@ class TestReconcile(_ScratchCwdMixin, unittest.TestCase):
         from sag import reconciler
 
         def slow_probe(kind, spec):
-            time.sleep(0.8)
+            time.sleep(1.5)
             return "up"
 
+        path = Path(config.shell_cwd) / "w.txt"
+        path.write_text("x", encoding="utf-8")
         with unittest.mock.patch.object(reconciler, "probe_one", slow_probe):
-            started = time.monotonic()
-            result = tool_shell("test:agent", "echo hi", "fast command")
-            path = Path(config.shell_cwd) / "w.txt"
-            tool_write_file("test:agent", str(path), "x", "write")
-            tool_patch_file("test:agent", str(path), "x", "y", "patch")
-            tool_delete_file("test:agent", str(path), "delete")
-            elapsed = time.monotonic() - started
-            self.assertEqual(result["stdout"], "hi\n")
-            # six 0.8 s probes, one after the other, per call, used to be 4.8 s each
-            self.assertLess(elapsed, 2.0)
+            trash_id = {}
+            calls = [
+                ("hub_shell", lambda: tool_shell("test:agent", "echo hi", "fast command")),
+                ("hub_write_file", lambda: tool_write_file("test:agent", str(path), "y", "write")),
+                ("hub_patch_file", lambda: tool_patch_file("test:agent", str(path), "y", "z", "patch")),
+                ("hub_delete_file", lambda: trash_id.update(tool_delete_file("test:agent", str(path), "delete"))),
+                ("hub_restore_file", lambda: tool_restore_file("test:agent", trash_id["trash_id"], "restore")),
+                # SERVER_AGENTS.md itself takes a different branch in both tools
+                ("hub_write_file (overview)", lambda: tool_write_file(
+                    "test:agent", config.overview_path, self.INVENTORY, "edit the map")),
+                ("hub_patch_file (overview)", lambda: tool_patch_file(
+                    "test:agent", config.overview_path, "## Conventions", "## Conventions", "edit the map")),
+            ]
+            for name, call in calls:
+                started = time.monotonic()
+                call()
+                elapsed = time.monotonic() - started
+                # waiting for a pass costs at least the 1.5 s of one probe
+                self.assertLess(elapsed, 1.0, f"{name} waited for the status refresh")
             self.assertTrue(reconciler.wait_reconciled(30))
         text = read_overview()
         self.assertEqual(text.count("| up |"), 6, text)
@@ -2233,19 +2244,28 @@ class TestHttpLayer(unittest.IsolatedAsyncioTestCase):
     # ---- the event loop stays free
 
     async def test_a_slow_token_check_does_not_freeze_other_connections(self):
+        import socket
+
         def slow_auth(header):
-            time.sleep(0.6)
+            time.sleep(0.8)
             return ("test:http", "operator")
 
-        with unittest.mock.patch.object(self.server_mod, "authenticate_bearer_token", slow_auth):
-            slow = asyncio.create_task(self._send(self._raw("POST", "/mcp", b"{}")))
-            await asyncio.sleep(0.1)
+        latency = {}
+
+        def probe_from_another_thread():
+            time.sleep(0.2)  # the slow request is inside its token check by now
             started = time.monotonic()
-            status, _ = self._parse(await self._send(self._raw("GET", "/health", token=None)))
-            health_latency = time.monotonic() - started
-            await slow
-        self.assertEqual(status, 200)
-        self.assertLess(health_latency, 0.4)
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+                sock.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                sock.recv(4096)
+            latency["health"] = time.monotonic() - started
+
+        with unittest.mock.patch.object(self.server_mod, "authenticate_bearer_token", slow_auth):
+            probe = asyncio.get_running_loop().run_in_executor(None, probe_from_another_thread)
+            await self._send(self._raw("POST", "/mcp", b"{}"))
+            await probe
+        # a token check on the event loop itself would make this wait for the rest of its 0.8 s
+        self.assertLess(latency["health"], 0.4)
 
     async def test_many_long_running_calls_do_not_starve_the_pool(self):
         n = 12
@@ -2254,6 +2274,28 @@ class TestHttpLayer(unittest.IsolatedAsyncioTestCase):
             self.server_mod.configure_event_loop(asyncio.get_running_loop())
             # all n calls must be running at the same time to pass the barrier: a smaller default pool would time out
             await asyncio.gather(*(asyncio.to_thread(barrier.wait, 5) for _ in range(n)))
+
+    async def test_run_server_configures_the_loop_and_holds_on_to_its_background_task(self):
+        server = self.server_mod
+
+        class Stop(Exception):
+            pass
+
+        before = set(server._BACKGROUND_TASKS)
+        try:
+            with unittest.mock.patch.object(server, "configure_event_loop") as configure, \
+                    unittest.mock.patch.object(server, "init_db"), \
+                    unittest.mock.patch.object(server, "ensure_document"), \
+                    unittest.mock.patch.object(server, "reconcile"), \
+                    unittest.mock.patch.object(server.asyncio, "start_server", side_effect=Stop):
+                with self.assertRaises(Stop):
+                    await server.run_server()
+            configure.assert_called_once()
+            held = set(server._BACKGROUND_TASKS) - before
+            self.assertEqual(len(held), 1)  # asyncio only keeps a weak reference to a task
+        finally:
+            for task in list(server._BACKGROUND_TASKS - before):
+                task.cancel()
 
     # ---- legacy SSE sessions belong to one agent
 
