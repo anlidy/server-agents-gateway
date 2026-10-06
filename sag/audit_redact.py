@@ -15,8 +15,11 @@ _REDACTION_RULES: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)(cf-access-client-secret\s*:\s*)\S+"), r"\1***"),
     (re.compile(r"(?i)(cf-access-client-id\s*:\s*)\S+"), r"\1***"),
     # SAG token: sag_<agent_id with ':' -> '_'>_<48 hex>. Require a hex tail (16+ so a
-    # truncated token still counts) so names like /tmp/sag_patches stay readable.
-    (re.compile(r"\bsag_[A-Za-z0-9_.\-]*?_[0-9a-f]{16,}\b"), "***TOKEN***"),
+    # truncated token still counts) so names like /tmp/sag_patches stay readable. The agent_id part
+    # is matched loosely: tokens issued before ids were validated may contain any non-space character.
+    (re.compile(r"\bsag_\S*?_[0-9a-f]{16,}\b"), "***TOKEN***"),
+    # ... and the secret itself is the 48 hex digits after the last '_', even when the id has spaces.
+    (re.compile(r"(?<=_)[0-9a-f]{48}\b"), "***TOKEN***"),
     (re.compile(r"\bcfast_[A-Za-z0-9]+\b"), "***SECRET***"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]+\b"), "***PAT***"),
     (re.compile(r"\bsk-[A-Za-z0-9]{10,}\b"), "***API_KEY***"),

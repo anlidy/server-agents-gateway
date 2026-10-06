@@ -4,11 +4,25 @@ Implements Zero-Trust Per-Agent Bearer Token lookup and issuance.
 """
 
 import hashlib
-import hmac
+import re
 import secrets
 import time
 from typing import Optional, Tuple
 from .db import get_db_connection
+
+# `name` or `prefix:name[:...]`. These ids end up inside the bearer token and inside recipient
+# expressions (`*`, `prefix:*`, `@group`, comma lists), so anything beyond this set breaks
+# routing and, worse, the audit redaction that has to recognise the token.
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}(:[A-Za-z0-9_.\-]{1,64}){0,3}$")
+
+
+def validate_agent_id(agent_id: str) -> str:
+    if not isinstance(agent_id, str) or not _AGENT_ID_RE.match(agent_id):
+        raise ValueError(
+            "invalid agent_id: use letters, digits, '_', '.', '-', with ':' between parts "
+            "(for example laptop:claude); no spaces, '*', ',' or leading '@'"
+        )
+    return agent_id
 
 
 def hash_token(token: str) -> str:
@@ -55,6 +69,7 @@ def issue_agent_token(agent_id: str, role: str = "admin") -> str:
     Generates a secure random 32-byte hex token for a specific Agent and persists it.
     Prefix: ag_<agent_suffix>_<token>
     """
+    validate_agent_id(agent_id)
     raw_token = f"sag_{agent_id.replace(':', '_')}_{secrets.token_hex(24)}"
     token_h = hash_token(raw_token)
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -66,6 +81,7 @@ def issue_agent_token(agent_id: str, role: str = "admin") -> str:
             VALUES (?, ?, ?, 'ACTIVE', ?)
             ON CONFLICT(agent_id) DO UPDATE SET
                 token_hash = excluded.token_hash,
+                role = excluded.role,
                 status = 'ACTIVE',
                 created_at = excluded.created_at;
             """,

@@ -564,6 +564,13 @@ def main() -> None:
         admin_agent = sys.argv[2] if len(sys.argv) > 2 else config.root_admin_agent_id
         token = issue_agent_token(admin_agent, role="admin")
         print(f"Issued ROOT ADMIN token for [{admin_agent}]: {token}")
+        if admin_agent != config.root_admin_agent_id:
+            print(
+                f"warning: only [{config.root_admin_agent_id}] (ROOT_ADMIN_AGENT_ID) can use the admin tools; "
+                f"a token for [{admin_agent}] will not see them. Set ROOT_ADMIN_AGENT_ID={admin_agent} in .env "
+                "or issue the token for the configured id.",
+                file=sys.stderr,
+            )
     elif len(sys.argv) > 1 and sys.argv[1] == "issue-token":
         init_db()
         agent = sys.argv[2] if len(sys.argv) > 2 else "desktop:cursor"

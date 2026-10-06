@@ -3,6 +3,7 @@ Tests for server-agents-gateway v2: open shell, trash, split audit, document ove
 """
 
 import contextlib
+import io
 import json
 import os
 import shutil
@@ -1298,6 +1299,72 @@ class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
         row = query_audit_logs(action_type="file_read", limit=1)[0]
         self.assertEqual(row["status"], "SUCCESS")
         self.assertTrue(json.loads(row["params_json"])["truncated"])
+
+
+class TestCredentials(unittest.TestCase):
+    def setUp(self):
+        _wipe_db()
+        init_db()
+
+    def tearDown(self):
+        _wipe_db()
+
+    def test_agent_id_format_is_validated_at_issuance(self):
+        for bad in ("", " ", "a b", "ops team:bot", "x,y", "@group", "*", "wsl:*", "a/b", "\u514b\u52b3\u5fb7",
+                    "a" * 65, ":x", "x:", "a::b", "a:b:c:d:e", None, 5):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                issue_agent_token(bad, "operator")
+        for good in ("cron", "laptop:claude", "mobile:xiaoyao", "wsl:red-team.x", "a:b:c", "A_1.2-3"):
+            with self.subTest(good=good):
+                self.assertEqual(authenticate_bearer_token(issue_agent_token(good, "operator"))[0], good)
+
+    def test_online_issuing_rejects_bad_ids_too(self):
+        with self.assertRaises(ValueError):
+            tool_issue_agent_token(
+                caller_agent_id=config.root_admin_agent_id, caller_role="admin", agent_id="two words"
+            )
+        self.assertEqual(
+            [r for r in query_audit_logs(action_type="token_issue")], [], "nothing was issued, nothing to record"
+        )
+
+    def test_tokens_of_unusual_legacy_ids_are_still_redacted(self):
+        from sag.audit_redact import redact_secrets
+
+        secret = "ab12" * 12
+        for agent_id in ("laptop_claude", "\u514b\u52b3\u5fb7", "ops team_bot", "a/b_c", "x,y_z"):
+            with self.subTest(agent_id=agent_id):
+                text = redact_secrets(f"export T=sag_{agent_id}_{secret} # and again: sag_{agent_id}_{secret}")
+                self.assertNotIn(secret, text)
+                self.assertNotIn(secret[:16], text)
+
+    def test_reissuing_changes_the_role(self):
+        issue_agent_token("dup:agent", "operator")
+        self.assertEqual(authenticate_bearer_token(issue_agent_token("dup:agent", "admin")), ("dup:agent", "admin"))
+        self.assertEqual(authenticate_bearer_token(issue_agent_token("dup:agent", "operator")), ("dup:agent", "operator"))
+
+    def test_reissuing_invalidates_the_previous_token(self):
+        old = issue_agent_token("rot:agent", "operator")
+        new = issue_agent_token("rot:agent", "operator")
+        self.assertIsNone(authenticate_bearer_token(old))
+        self.assertIsNotNone(authenticate_bearer_token(new))
+
+    def test_issue_admin_warns_when_the_id_is_not_the_configured_root_admin(self):
+        from sag import server
+
+        def run(agent):
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", ["server.py", "issue-admin", agent]), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                server.main()
+            return out.getvalue(), err.getvalue()
+
+        out, err = run("someone:else")
+        self.assertIn("Issued ROOT ADMIN token", out)
+        self.assertIn("will not see them", err)
+        self.assertIn(config.root_admin_agent_id, err)
+        out, err = run(config.root_admin_agent_id)
+        self.assertIn("Issued ROOT ADMIN token", out)
+        self.assertEqual(err, "")
 
 
 class TestCollab(unittest.TestCase):
