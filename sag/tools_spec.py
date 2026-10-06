@@ -10,6 +10,11 @@ MCP_TOOLS_SPEC = [
             "`rm` typed directly in this command goes to the recycle bin (a symlink is trashed as the link, "
             "never its target). Child processes (scripts, dpkg/apt, make, xargs, find -exec, sudo) and "
             "/bin/rm use the real rm and delete for real. "
+            "stdout and stderr are captured until the command ends or times out; together they are capped at 2 MiB by default "
+            "(`truncated: true` when more was produced). "
+            "To start something in the background, redirect its output "
+            "(`nohup cmd >/tmp/cmd.log 2>&1 &`): a background process that keeps the output pipes open "
+            "holds this call until the timeout, and the process group is then killed. "
             "If you add, remove, or move a service, update the matching ### in SERVER_AGENTS.md "
             "Inventory (see ## Conventions for `- probe:` format) in the same turn."
         ),
@@ -26,7 +31,11 @@ MCP_TOOLS_SPEC = [
     },
     {
         "name": "hub_read_file",
-        "description": "Read a UTF-8 text file. Directories and binary files are rejected.",
+        "description": (
+            "Read a UTF-8 text file. Directories and binary files are rejected. "
+            "Lines end at \\n. At most 2 MiB (by default) is returned per call; when `truncated` is true, "
+            "call again with `offset` set to `next_offset`."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -184,7 +193,7 @@ MCP_TOOLS_SPEC = [
                 "target": {"type": "string"},
                 "action_type": {"type": "string"},
                 "tool_name": {"type": "string"},
-                "status": {"type": "string", "enum": ["SUCCESS", "FAILED", "REJECTED"]},
+                "status": {"type": "string", "enum": ["SUCCESS", "FAILED", "REJECTED", "ERROR"]},
                 "keyword": {"type": "string"},
                 "limit": {"type": "integer", "default": 20},
                 "offset": {"type": "integer", "default": 0},

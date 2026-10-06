@@ -4,6 +4,7 @@ v2 MCP tool implementations.
 
 from __future__ import annotations
 
+import codecs
 import difflib
 import json
 import os
@@ -75,6 +76,19 @@ def tool_shell(
             stderr=str(exc),
         )
         raise
+    except Exception as exc:
+        # Anything else (spawn failure, bad arguments, a bug) still leaves a trace: every call is audited.
+        append_audit(
+            agent_id=agent_id,
+            tool_name="hub_shell",
+            action_type="shell_exec",
+            target=str(command or "")[:200],
+            reason=reason,
+            status="ERROR",
+            params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
+            stderr=f"{type(exc).__name__}: {exc}",
+        )
+        raise
     finally:
         try:
             reconcile()
@@ -115,6 +129,55 @@ def tool_shell(
     }
 
 
+_SKIP_CHUNK = 64 * 1024
+
+
+def _skip_line(f) -> bool:
+    """Consume one line without keeping it, however long it is. False at EOF."""
+    seen = False
+    while True:
+        part = f.readline(_SKIP_CHUNK)
+        if not part:
+            return seen
+        seen = True
+        if part.endswith(b"\n"):
+            return True
+
+
+def _read_window(f, start: int, max_lines: Optional[int], cap: int):
+    """
+    Lines [start, start + max_lines) of an open binary file, as bytes, read without loading
+    the whole file and never holding more than `cap` bytes. Lines end at b"\\n" only, like
+    sed and cat -n. Only whole lines are returned, so a caller that follows next_offset
+    loses nothing; the exception is a single line longer than `cap`, of which only the
+    beginning is returned. Returns (data, full_lines, cut): `cut` is None when nothing was
+    held back, "line" when the next line did not fit and is left for the next call,
+    "partial" when that one line is longer than the cap and was cut short.
+    """
+    chunks: List[bytes] = []
+    size = full = 0
+    cut: Optional[str] = None
+    for _ in range(start):
+        if not _skip_line(f):
+            return b"", 0, None
+    while max_lines is None or full < max_lines:
+        room = cap - size
+        line = f.readline(room + 1)
+        if not line:
+            break
+        if len(line) > room:
+            if full == 0:
+                chunks.append(line[:room])
+                cut = "partial"
+            else:
+                cut = "line"
+            break
+        chunks.append(line)
+        size += len(line)
+        full += 1
+    return b"".join(chunks), full, cut
+
+
 def tool_read_file(
     agent_id: str,
     path: str,
@@ -135,18 +198,48 @@ def tool_read_file(
     if target.is_dir():
         exc = IsADirectoryError(str(target))
         _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
-    raw = target.read_bytes()
-    if b"\x00" in raw[:8192]:
+    start = max(int(offset) - 1, 0)
+    max_lines = None if limit is None else max(int(limit), 0)
+    cap = max(1, config.read_max_bytes)
+    # One open, and peek() instead of read() for the binary check: it consumes nothing, so a
+    # pipe or other one-shot file is still read from its first byte.
+    with open(target, "rb") as f:
+        binary = b"\x00" in f.peek(8192)[:8192]
+        window = None if binary else _read_window(f, start, max_lines, cap)
+    if window is None:
         exc = ValueError("binary file")
         _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
+    data, full_lines, cut = window
     try:
-        text = raw.decode("utf-8")
+        # A cut inside the one over-long line may split a multi-byte character: hold that tail back.
+        content = codecs.getincrementaldecoder("utf-8")().decode(data, final=cut != "partial")
     except UnicodeDecodeError as exc:
-        _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
-    lines = text.splitlines(True)
-    start = max(int(offset) - 1, 0)
-    chunk = lines[start:] if limit is None else lines[start : start + int(limit)]
-    content = "".join(chunk)
+        # Only the returned lines are validated, so say where in the file the bad byte is.
+        bad_line = start + 1 + data[: exc.start].count(b"\n")
+        err = ValueError(f"invalid UTF-8 at line {bad_line}: {exc.reason} (byte 0x{data[exc.start]:02x})")
+        _audit_then_raise(
+            agent_id, "hub_read_file", "file_read", target, "", "FAILED", err,
+            params={"offset": offset, "limit": limit, "invalid_utf8_line": bad_line},
+        )
+    result: Dict[str, Any] = {"path": str(target), "content": content}
+    params: Dict[str, Any] = {"offset": offset, "limit": limit}
+    if cut:
+        # "line": the next line did not fit, resume at it. "partial": line `start+1` alone is over the
+        # cap and only its beginning came back; the rest of it is not reachable by line number.
+        next_offset = start + full_lines + (2 if cut == "partial" else 1)
+        result["truncated"] = True
+        result["next_offset"] = next_offset
+        if cut == "partial":
+            result["note"] = (
+                f"Line {start + 1} is longer than the {cap}-byte cap (GATEWAY_READ_MAX_BYTES); only its beginning "
+                f"is returned. Continue with offset={next_offset}; use hub_shell for byte ranges."
+            )
+        else:
+            result["note"] = (
+                f"Capped at {cap} bytes (GATEWAY_READ_MAX_BYTES), at a line boundary. "
+                f"Continue with offset={next_offset}."
+            )
+        params["truncated"] = True
     append_audit(
         agent_id=agent_id,
         tool_name="hub_read_file",
@@ -155,9 +248,9 @@ def tool_read_file(
         reason="",
         status="SUCCESS",
         stdout=content,
-        params={"offset": offset, "limit": limit},
+        params=params,
     )
-    return {"path": str(target), "content": content}
+    return result
 
 
 def tool_list_dir(agent_id: str, path: str) -> Dict[str, Any]:
