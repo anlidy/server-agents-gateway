@@ -7,11 +7,17 @@ from __future__ import annotations
 import json
 import re
 import socket
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import config
 from .db import get_db_connection
+
+# SERVER_AGENTS.md is rewritten in place by the status refresh (probes, in a worker thread) and by
+# agents (hub_write_file / hub_patch_file), and read by everyone. write_text() truncates before it
+# writes, so without one lock a reader could see an empty file and two writers could interleave.
+doc_lock = threading.RLock()
 
 STATUS_START = "<!-- sag-status:start -->"
 STATUS_END = "<!-- sag-status:end -->"
@@ -35,9 +41,10 @@ def overview_path() -> Path:
 
 def read_overview() -> str:
     p = overview_path()
-    if not p.exists():
-        return ""
-    return p.read_text(encoding="utf-8")
+    with doc_lock:
+        if not p.exists():
+            return ""
+        return p.read_text(encoding="utf-8")
 
 
 def _section(text: str, heading: str) -> str:
@@ -166,7 +173,9 @@ def parse_probes(text: str) -> List[Dict[str, str]]:
 def untracked_containers(inventory_text: str, names: List[str]) -> List[str]:
     out = []
     for n in names:
-        if n and n not in inventory_text:
+        # the whole name, not a substring: a container called "db" is not tracked just because
+        # the word "database" appears somewhere in the inventory
+        if n and not re.search(r"(?<![\w.\-])" + re.escape(n) + r"(?![\w.\-])", inventory_text):
             out.append(f"docker:{n}")
     return out
 
@@ -250,22 +259,24 @@ def _export_v1_assets() -> str:
 
 def ensure_document() -> None:
     p = overview_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if not p.exists():
-        p.write_text(_skeleton(socket.gethostname()), encoding="utf-8")
-    text = p.read_text(encoding="utf-8")
-    if inventory_is_empty(text):
-        dumped = _export_v1_assets()
-        if dumped:
-            if "## Inventory" in text:
-                text = text.replace("## Inventory", "## Inventory\n\n" + dumped, 1)
-            else:
-                text += "\n## Inventory\n\n" + dumped
-            p.write_text(text, encoding="utf-8")
+    with doc_lock:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_text(_skeleton(socket.gethostname()), encoding="utf-8")
+        text = p.read_text(encoding="utf-8")
+        if inventory_is_empty(text):
+            dumped = _export_v1_assets()
+            if dumped:
+                if "## Inventory" in text:
+                    text = text.replace("## Inventory", "## Inventory\n\n" + dumped, 1)
+                else:
+                    text += "\n## Inventory\n\n" + dumped
+                p.write_text(text, encoding="utf-8")
 
 
 def write_handwritten(content: str) -> None:
     """Write agent-supplied overview, stripping any status fence they included."""
     cleaned = strip_status_block(content)
-    overview_path().parent.mkdir(parents=True, exist_ok=True)
-    overview_path().write_text(cleaned if cleaned.endswith("\n") else cleaned + "\n", encoding="utf-8")
+    with doc_lock:
+        overview_path().parent.mkdir(parents=True, exist_ok=True)
+        overview_path().write_text(cleaned if cleaned.endswith("\n") else cleaned + "\n", encoding="utf-8")

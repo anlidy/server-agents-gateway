@@ -78,6 +78,9 @@ from sag.tools_spec import MCP_TOOLS_SPEC
 
 
 def _wipe_db():
+    from sag.reconciler import wait_reconciled
+
+    wait_reconciled(15)  # tool calls start a background refresh; let it finish before its database goes away
     db_p = Path(os.environ["GATEWAY_DB_PATH"])
     for suffix in ("", "-wal", "-shm"):
         p = Path(str(db_p) + suffix) if suffix else db_p
@@ -1611,6 +1614,203 @@ class TestDispatchAudit(_ScratchCwdMixin, unittest.TestCase):
             conn.execute("UPDATE trash_items SET deleted_at = '2026-01-01T00:00:00+0000';")
             conn.commit()
         self.assertEqual([Path(i["original_path"]).name for i in list_trash()], ["t3", "t2", "t1", "t0"])
+
+
+class TestReconcile(_ScratchCwdMixin, unittest.TestCase):
+    """The status refresh must not make every tool call wait for slow probes, nor corrupt SERVER_AGENTS.md."""
+
+    INVENTORY = "# h\n\n## Host\n\n## Inventory\n\n" + "".join(
+        f"### svc{i}\n\n- probe: tcp 127.0.0.1:{9000 + i}\n\n" for i in range(6)
+    ) + "## Conventions\n"
+
+    def setUp(self):
+        super().setUp()
+        ov = Path(config.overview_path)
+        if ov.exists():
+            ov.unlink()
+        ensure_document()
+        Path(config.overview_path).write_text(self.INVENTORY, encoding="utf-8")
+
+    def tearDown(self):
+        super().tearDown()
+        ov = Path(config.overview_path)
+        if ov.exists():
+            ov.unlink()
+
+    def test_tool_calls_do_not_wait_for_slow_probes(self):
+        from sag import reconciler
+
+        def slow_probe(kind, spec):
+            time.sleep(0.8)
+            return "up"
+
+        with unittest.mock.patch.object(reconciler, "probe_one", slow_probe):
+            started = time.monotonic()
+            result = tool_shell("test:agent", "echo hi", "fast command")
+            path = Path(config.shell_cwd) / "w.txt"
+            tool_write_file("test:agent", str(path), "x", "write")
+            tool_patch_file("test:agent", str(path), "x", "y", "patch")
+            tool_delete_file("test:agent", str(path), "delete")
+            elapsed = time.monotonic() - started
+            self.assertEqual(result["stdout"], "hi\n")
+            # six 0.8 s probes, one after the other, per call, used to be 4.8 s each
+            self.assertLess(elapsed, 2.0)
+            self.assertTrue(reconciler.wait_reconciled(30))
+        text = read_overview()
+        self.assertEqual(text.count("| up |"), 6, text)
+
+    def test_probes_run_side_by_side(self):
+        from sag import reconciler
+
+        def slow_probe(kind, spec):
+            time.sleep(0.5)
+            return spec
+
+        with unittest.mock.patch.object(reconciler, "probe_one", slow_probe), \
+                unittest.mock.patch.object(reconciler, "list_docker_names", lambda: []):
+            started = time.monotonic()
+            probes, untracked = reconciler.collect_probes_and_untracked()
+            elapsed = time.monotonic() - started
+        self.assertEqual([p["state"] for p in probes], [f"127.0.0.1:{9000 + i}" for i in range(6)])  # order kept
+        self.assertLess(elapsed, 1.6)  # sequentially: 3.0 s
+
+    def test_requests_while_a_pass_is_running_are_coalesced(self):
+        from sag import reconciler
+
+        runs, gate = [], threading.Event()
+
+        def fake_reconcile():
+            runs.append(time.monotonic())
+            gate.wait(5)
+
+        with unittest.mock.patch.object(reconciler, "reconcile", fake_reconcile):
+            reconciler.request_reconcile()
+            deadline = time.monotonic() + 3
+            while not runs and time.monotonic() < deadline:
+                time.sleep(0.01)
+            for _ in range(30):
+                reconciler.request_reconcile()  # all while the first pass is still running
+            gate.set()
+            self.assertTrue(reconciler.wait_reconciled(10))
+        self.assertEqual(len(runs), 2)  # the running pass, plus one follow-up for everything that arrived meanwhile
+
+    def test_a_failing_pass_does_not_wedge_the_worker(self):
+        from sag import reconciler
+
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("probe exploded")
+
+        with unittest.mock.patch.object(reconciler, "reconcile", flaky), contextlib.redirect_stdout(io.StringIO()) as out:
+            reconciler.request_reconcile()
+            self.assertTrue(reconciler.wait_reconciled(10))
+            reconciler.request_reconcile()
+            self.assertTrue(reconciler.wait_reconciled(10))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("background pass failed", out.getvalue())
+
+    def test_rebuild_overview_still_returns_the_refreshed_document(self):
+        from sag import reconciler
+
+        with unittest.mock.patch.object(reconciler, "probe_one", lambda kind, spec: "down"):
+            text = tool_rebuild_overview("check")
+        self.assertEqual(text.count("| down |"), 6)
+
+    def test_overview_readers_and_writers_take_the_document_lock(self):
+        from sag import reconciler
+        from sag.overview import doc_lock, write_handwritten
+
+        attempts = {
+            "read": lambda: read_overview(),
+            "write": lambda: write_handwritten("# edited\n\n## Inventory\n"),
+            "ensure": lambda: ensure_document(),
+        }
+        with unittest.mock.patch.object(reconciler, "probe_one", lambda kind, spec: "up"), \
+                unittest.mock.patch.object(reconciler, "list_docker_names", lambda: []):
+            attempts["refresh"] = reconciler.refresh_status_block
+            for name, action in attempts.items():
+                with self.subTest(name):
+                    done = threading.Event()
+                    with doc_lock:
+                        t = threading.Thread(target=lambda: (action(), done.set()), daemon=True)
+                        t.start()
+                        self.assertFalse(done.wait(0.4), f"{name} did not wait for the lock")
+                    self.assertTrue(done.wait(5), f"{name} never finished")
+                    t.join(2)
+
+    def test_concurrent_readers_never_see_a_half_written_document(self):
+        from sag import reconciler
+        from sag.overview import write_handwritten
+
+        stop = threading.Event()
+        problems = []
+
+        def writer():
+            n = 0
+            while not stop.is_set():
+                n += 1
+                write_handwritten(f"# edit {n}\n\n## Host\n\n## Inventory\n\n## Conventions\n" + "filler\n" * 200)
+
+        def refresher():
+            with unittest.mock.patch.object(reconciler, "list_docker_names", lambda: []):
+                while not stop.is_set():
+                    reconciler.refresh_status_block()
+
+        def reader():
+            while not stop.is_set():
+                text = read_overview()
+                if not text.startswith("#") or "## Inventory" not in text:
+                    problems.append(text[:60])
+
+        threads = [threading.Thread(target=f, daemon=True) for f in (writer, refresher, reader, reader)]
+        for t in threads:
+            t.start()
+        time.sleep(1.5)
+        stop.set()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(problems, [])
+
+    def test_the_http_probe_only_opens_http_urls(self):
+        from sag import reconciler
+
+        with unittest.mock.patch("urllib.request.urlopen") as urlopen:
+            for spec in ("file:///etc/hostname", "ftp://host/x", "gopher://x", "/just/a/path"):
+                self.assertEqual(reconciler.probe_one("http", spec), "unknown", spec)
+            urlopen.assert_not_called()
+
+    def test_http_probe_reports_up_and_down(self):
+        import http.server
+
+        from sag import reconciler
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200 if self.path == "/ok" else 503)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)  # cleanups run last-in first-out: stop serving, then close the socket
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        self.assertEqual(reconciler.probe_one("http", base + "/ok"), "up")
+        self.assertEqual(reconciler.probe_one("http", base + "/bad"), "down")
+
+    def test_untracked_containers_match_whole_names_only(self):
+        inventory = "### shop\n- probe: docker app-db\n\nthe database lives elsewhere, see my.cache.v2\n"
+        names = ["db", "app", "app-db", "cache", "my.cache.v2", "data", "base"]
+        self.assertEqual(
+            untracked_containers(inventory, names),
+            ["docker:db", "docker:app", "docker:cache", "docker:data", "docker:base"],
+        )
+        self.assertEqual(untracked_containers("x (a+b)", ["a+b", "a.b"]), ["docker:a.b"])
 
 
 class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):

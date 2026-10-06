@@ -23,7 +23,7 @@ from .config import config
 from .db import append_audit, get_audit_event, get_db_connection, query_audit_logs
 from .executor import CommandExecutionError, execute_shell
 from .overview import overview_path, read_overview, select_sections, write_handwritten
-from .reconciler import collect_host_status, reconcile
+from .reconciler import collect_host_status, reconcile, request_reconcile
 from .trash import ProtectedPathError, is_protected, lexical_path, list_trash, restore_trash, trash_put
 
 
@@ -118,7 +118,7 @@ def tool_shell(
             raise
         finally:
             try:
-                reconcile()
+                request_reconcile()
             except Exception:
                 pass
         trash_ids = _read_trash_ids(trash_file, agent_id)
@@ -422,7 +422,7 @@ def tool_patch_file(
     else:
         target.write_text(new, encoding="utf-8")
     try:
-        reconcile()
+        request_reconcile()
     except Exception:
         pass
     diff_lines = list(
@@ -477,13 +477,13 @@ def tool_write_file(agent_id: str, path: str, content: str, reason: str) -> Dict
     if target.resolve() == overview_path().resolve():
         write_handwritten(content)
         try:
-            reconcile()
+            request_reconcile()
         except Exception:
             pass
     else:
         target.write_text(content, encoding="utf-8")
         try:
-            reconcile()
+            request_reconcile()
         except Exception:
             pass
     diff_lines = list(
@@ -550,7 +550,7 @@ def _delete_one(agent_id: str, path: str, reason: str) -> Dict[str, Any]:
         return {"path": str(target), "status": "NOT_FOUND"}
     trash_id = trash_put(target, source="delete_file", agent_id=agent_id)
     try:
-        reconcile()
+        request_reconcile()
     except Exception:
         pass
     append_audit(
@@ -595,7 +595,7 @@ def tool_restore_file(agent_id: str, trash_id: str, reason: str, overwrite: Any 
         params=result,
     )
     try:
-        reconcile()
+        request_reconcile()
     except Exception:
         pass
     return result

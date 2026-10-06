@@ -19,7 +19,7 @@ from .auth import authenticate_bearer_token, issue_agent_token
 from .config import config
 from .db import append_audit, init_db
 from .overview import ensure_document
-from .reconciler import reconcile
+from .reconciler import reconcile, request_reconcile
 from .tools import (
     tool_delete_file,
     tool_get_audit_event,
@@ -679,7 +679,7 @@ async def _periodic_reconcile_loop():
     while True:
         await asyncio.sleep(interval)
         try:
-            await asyncio.to_thread(reconcile)
+            request_reconcile()  # coalesces with a refresh a tool call already started
         except Exception as exc:
             print(f"[reconcile] periodic pass failed: {exc}")
 
