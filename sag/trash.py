@@ -8,6 +8,7 @@ import errno
 import json
 import os
 import shutil
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -322,11 +323,35 @@ def purge_trash_items(ids: List[str]) -> int:
         return n
 
 
+_RM_LONG_FLAGS = {
+    "--recursive": "recursive",
+    "--force": "force",
+    "--dir": "dir_ok",
+    # accepted and ignored: the bin never crosses a filesystem boundary prompt and never "preserves root"
+    "--verbose": None,
+    "--one-file-system": None,
+    "--preserve-root": None,
+    "--no-preserve-root": None,
+    "--interactive=never": None,
+}
+
+
+def _report_trash_id(item_id: str) -> None:
+    """Tell the gateway (SAG_TRASH_FILE) or, run by hand, the user (stderr) which bin item was created."""
+    path = os.environ.get("SAG_TRASH_FILE")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(item_id + "\n")
+            return
+        except OSError:
+            pass
+    print(f"SAG_TRASH {item_id}", file=sys.stderr)
+
+
 def trash_from_rm_argv(argv: List[str], agent_id: Optional[str] = None) -> int:
-    """GNU-rm-ish front-end that trash_puts operands. Prints SAG_TRASH ids on stderr."""
-    recursive = False
-    force = False
-    dir_ok = False
+    """GNU-rm-ish front-end that trash_puts operands. Reports each new bin id via _report_trash_id."""
+    flags = {"recursive": False, "force": False, "dir_ok": False}
     operands: List[str] = []
     i = 0
     while i < len(argv):
@@ -334,34 +359,27 @@ def trash_from_rm_argv(argv: List[str], agent_id: Optional[str] = None) -> int:
         if a == "--":
             operands.extend(argv[i + 1 :])
             break
-        if a in ("-r", "-R", "--recursive"):
-            recursive = True
-        elif a == "-f":
-            force = True
-        elif a == "-d" or a == "--dir":
-            dir_ok = True
-        elif a == "-v" or a == "--verbose":
-            pass
-        elif a.startswith("-") and a != "-":
-            # bundled short flags
-            if a.startswith("--"):
-                print(f"rm: unsupported option {a}", file=__import__("sys").stderr)
+        if a.startswith("--"):
+            if a not in _RM_LONG_FLAGS:
+                print(f"rm: unsupported option {a}", file=sys.stderr)
                 return 1
-            for ch in a[1:]:
+            if _RM_LONG_FLAGS[a]:
+                flags[_RM_LONG_FLAGS[a]] = True
+        elif a.startswith("-") and a != "-":
+            for ch in a[1:]:  # bundled short flags
                 if ch in ("r", "R"):
-                    recursive = True
+                    flags["recursive"] = True
                 elif ch == "f":
-                    force = True
+                    flags["force"] = True
                 elif ch == "d":
-                    dir_ok = True
-                elif ch == "v":
-                    pass
-                else:
-                    print(f"rm: unsupported option -{ch}", file=__import__("sys").stderr)
+                    flags["dir_ok"] = True
+                elif ch != "v":
+                    print(f"rm: unsupported option -{ch}", file=sys.stderr)
                     return 1
         else:
             operands.append(a)
         i += 1
+    recursive, force, dir_ok = flags["recursive"], flags["force"], flags["dir_ok"]
 
     if not operands:
         return 0 if force else 1
@@ -375,21 +393,21 @@ def trash_from_rm_argv(argv: List[str], agent_id: Optional[str] = None) -> int:
             resolved = Path(os.path.abspath(os.path.expanduser(op)))
         if not os.path.lexists(resolved):
             if not force:
-                print(f"rm: cannot remove '{op}': No such file or directory", file=__import__("sys").stderr)
+                print(f"rm: cannot remove '{op}': No such file or directory", file=sys.stderr)
                 errors = True
             continue
         if resolved.is_dir() and not resolved.is_symlink() and not recursive and not dir_ok:
-            print(f"rm: cannot remove '{op}': Is a directory", file=__import__("sys").stderr)
+            print(f"rm: cannot remove '{op}': Is a directory", file=sys.stderr)
             errors = True
             continue
         try:
             item_id = trash_put(resolved, source="rm_wrapper", agent_id=who)
-            print(f"SAG_TRASH {item_id}", file=__import__("sys").stderr)
+            _report_trash_id(item_id)
         except ProtectedPathError as exc:
-            print(f"rm: {exc}", file=__import__("sys").stderr)
+            print(f"rm: {exc}", file=sys.stderr)
             errors = True
         except Exception as exc:
             if not force:
-                print(f"rm: {exc}", file=__import__("sys").stderr)
+                print(f"rm: {exc}", file=sys.stderr)
                 errors = True
     return 1 if errors else 0

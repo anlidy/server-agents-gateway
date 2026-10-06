@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from .audit_redact import redact_secrets, redact_structure
+from .clip import TRUNCATED_MARK as _TRUNCATED_MARK, clip_output
 from .config import config
 
 _ACTION_TO_TOOL = {
@@ -207,9 +208,6 @@ def _migrate_v1_audit() -> None:
         conn.commit()
 
 
-_TRUNCATED_MARK = "\n[truncated]\n"
-
-
 def _clip_text(text: str, max_bytes: int) -> tuple[str, bool]:
     if not text:
         return text, False
@@ -254,21 +252,11 @@ def append_audit(
     if safe_diff:
         safe_diff, _ = _clip_text(safe_diff, 64 * 1024)
     max_body = config.audit_body_max_bytes
-    truncated = False
     # Clip the content, not the marker: a body that arrives already marked must not be cut through its
     # own marker (which left "\n[" fragments or two markers), and still counts as truncated.
     out, out_marked = _split_mark(safe_stdout or "")
     err, err_marked = _split_mark(safe_stderr or "")
-    out_b = out.encode("utf-8")
-    err_b = err.encode("utf-8")
-    if len(out_b) + len(err_b) > max_body:
-        truncated = True
-        if len(out_b) > max_body:
-            out, _ = _clip_text(out, max_body)
-            err = _TRUNCATED_MARK
-        else:
-            remain = max_body - len(out_b)
-            err, _ = _clip_text(err, remain)
+    out, err, truncated = clip_output(out, err, max_body)
     if out_marked or err_marked:
         truncated = True
         if out_marked and not out.endswith(_TRUNCATED_MARK):

@@ -8,7 +8,9 @@ import codecs
 import difflib
 import json
 import os
+import re
 import stat
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,7 +19,7 @@ _LIST_DIR_MAX = 2000
 
 from .auth import issue_agent_token, revoke_agent_token
 from .config import config
-from .db import append_audit, get_audit_event, query_audit_logs
+from .db import append_audit, get_audit_event, get_db_connection, query_audit_logs
 from .executor import CommandExecutionError, execute_shell
 from .overview import overview_path, read_overview, select_sections, write_handwritten
 from .reconciler import collect_host_status, reconcile
@@ -38,17 +40,35 @@ def _audit_then_raise(agent_id, tool_name, action_type, target, reason, status, 
     raise exc
 
 
-def _extract_trash_ids(stderr: str) -> tuple[str, List[str]]:
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _read_trash_ids(path: str, agent_id: str) -> List[str]:
+    """
+    Ids the rm wrapper reported for this command, in order. Only ids that really are this agent's
+    rm_wrapper items in the bin count, so a command cannot make the audit row point at anything else.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            candidates = [ln.strip() for ln in f.read().splitlines()]
+    except OSError:
+        return []
     ids: List[str] = []
-    keep: List[str] = []
-    for line in (stderr or "").splitlines(True):
-        if line.startswith("SAG_TRASH "):
-            token = line.split()[1].strip() if len(line.split()) > 1 else ""
-            if token:
-                ids.append(token)
-        else:
-            keep.append(line)
-    return "".join(keep), ids
+    for c in candidates:
+        if _UUID_RE.match(c) and c not in ids:
+            ids.append(c)
+    if not ids:
+        return []
+    with get_db_connection() as conn:
+        known = {
+            r["id"]
+            for r in conn.execute(
+                f"SELECT id FROM trash_items WHERE source = 'rm_wrapper' AND deleted_by = ? "
+                f"AND id IN ({','.join('?' * len(ids))});",
+                (agent_id, *ids),
+            )
+        }
+    return [i for i in ids if i in known]
 
 
 def tool_shell(
@@ -60,41 +80,49 @@ def tool_shell(
 ) -> Dict[str, Any]:
     start = time.time()
     code, stdout, stderr, truncated = -1, "", "", False
+    trash_fd, trash_file = tempfile.mkstemp(prefix="sag-trash-")
+    os.close(trash_fd)
     try:
-        code, stdout, stderr, truncated = execute_shell(
-            command, cwd=cwd, timeout_seconds=timeout_seconds, agent_id=agent_id
-        )
-    except CommandExecutionError as exc:
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_shell",
-            action_type="shell_exec",
-            target=(command or "")[:200],
-            reason=reason,
-            status="REJECTED",
-            params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
-            stderr=str(exc),
-        )
-        raise
-    except Exception as exc:
-        # Anything else (spawn failure, bad arguments, a bug) still leaves a trace: every call is audited.
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_shell",
-            action_type="shell_exec",
-            target=str(command or "")[:200],
-            reason=reason,
-            status="ERROR",
-            params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
-            stderr=f"{type(exc).__name__}: {exc}",
-        )
-        raise
+        try:
+            code, stdout, stderr, truncated = execute_shell(
+                command, cwd=cwd, timeout_seconds=timeout_seconds, agent_id=agent_id, trash_file=trash_file
+            )
+        except CommandExecutionError as exc:
+            append_audit(
+                agent_id=agent_id,
+                tool_name="hub_shell",
+                action_type="shell_exec",
+                target=(command or "")[:200],
+                reason=reason,
+                status="REJECTED",
+                params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
+                stderr=str(exc),
+            )
+            raise
+        except Exception as exc:
+            # Anything else (spawn failure, bad arguments, a bug) still leaves a trace: every call is audited.
+            append_audit(
+                agent_id=agent_id,
+                tool_name="hub_shell",
+                action_type="shell_exec",
+                target=str(command or "")[:200],
+                reason=reason,
+                status="ERROR",
+                params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
+                stderr=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            try:
+                reconcile()
+            except Exception:
+                pass
+        trash_ids = _read_trash_ids(trash_file, agent_id)
     finally:
         try:
-            reconcile()
-        except Exception:
+            os.unlink(trash_file)
+        except OSError:
             pass
-    stderr, trash_ids = _extract_trash_ids(stderr)
     duration_ms = int((time.time() - start) * 1000)
     status = "SUCCESS" if code == 0 else "FAILED"
     workdir = cwd or config.shell_cwd

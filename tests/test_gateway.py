@@ -43,6 +43,7 @@ from sag.db import (
     init_db,
     query_audit_logs,
 )
+from sag.clip import TRUNCATED_MARK, clip_output
 from sag.executor import CommandExecutionError, _Capture, execute_shell
 from sag.overview import (
     STATUS_END,
@@ -1262,6 +1263,164 @@ class TestShellOutput(_ScratchCwdMixin, unittest.TestCase):
         with unittest.mock.patch("sag.executor.selectors.PollSelector", spy):
             execute_shell("echo hi")
         self.assertTrue(used)
+
+
+class TestClipAndTrashIds(_ScratchCwdMixin, unittest.TestCase):
+    """Big stdout must not evict stderr; recycle-bin ids must reach the audit row however the command redirects."""
+
+    def test_clip_output_fits_untouched(self):
+        self.assertEqual(clip_output("abc", "de", 5), ("abc", "de", False))
+        self.assertEqual(clip_output("", "", 0), ("", "", False))
+
+    def test_clip_output_keeps_a_stderr_share_when_stdout_is_huge(self):
+        out, err, clipped = clip_output("o" * 5000, "error: boom\n", 1000)
+        self.assertTrue(clipped)
+        self.assertEqual(err, "error: boom\n")  # not truncated, not replaced
+        self.assertTrue(out.endswith(TRUNCATED_MARK))
+        self.assertLessEqual(len(out.encode()) - len(TRUNCATED_MARK) + len(err.encode()), 1000)
+
+    def test_clip_output_stdout_that_exactly_fills_the_budget_does_not_wipe_stderr(self):
+        out, err, clipped = clip_output("o" * 1000, "note\n", 1000)
+        self.assertTrue(clipped)
+        self.assertEqual(err, "note\n")
+
+    def test_clip_output_stdout_gets_what_stderr_does_not_need(self):
+        out, err, clipped = clip_output("o" * 5000, "e" * 10, 1000)
+        self.assertEqual(len(out.encode()) - len(TRUNCATED_MARK), 990)
+
+    def test_clip_output_stderr_is_cut_when_it_is_the_one_that_overflows(self):
+        out, err, clipped = clip_output("fine\n", "e" * 5000, 1000)
+        self.assertEqual(out, "fine\n")
+        self.assertTrue(err.endswith(TRUNCATED_MARK))
+        self.assertEqual(len(err.encode()) - len(TRUNCATED_MARK), 995)
+
+    def test_clip_output_both_overflowing_marks_both_and_never_splits_a_character(self):
+        out, err, clipped = clip_output("\u4f60" * 2000, "\u597d" * 2000, 1000)
+        self.assertTrue(out.endswith(TRUNCATED_MARK) and err.endswith(TRUNCATED_MARK))
+        self.assertNotIn("\ufffd", out + err)
+        body = (out[: -len(TRUNCATED_MARK)] + err[: -len(TRUNCATED_MARK)]).encode()
+        self.assertLessEqual(len(body), 1000)
+        self.assertGreaterEqual(len(err[: -len(TRUNCATED_MARK)].encode()), 120)  # the reserve: 1000 // 8
+
+    def test_error_message_and_timeout_note_survive_a_flood_on_stdout(self):
+        with _config_override(audit_body_max_bytes=1000):
+            result = tool_shell(
+                "test:agent", "echo 'error: it broke' >&2; head -c 50000 /dev/zero | tr '\\0' a", "flood"
+            )
+            self.assertTrue(result["truncated"])
+            self.assertIn("error: it broke", result["stderr"])
+            slow = tool_shell(
+                "test:agent", "head -c 50000 /dev/zero | tr '\\0' a; sleep 30", "flood then hang", timeout_seconds=1
+            )
+        self.assertEqual(slow["exit_code"], -1)
+        self.assertIn("timed out after 1s", slow["stderr"])
+        body = get_audit_event(self._last_shell_event()["id"])
+        self.assertIn("timed out after 1s", body["stderr"])
+
+    def test_trash_ids_survive_big_stdout_and_every_redirection(self):
+        cwd = Path(config.shell_cwd)
+        variants = {
+            "plain": "rm {a} {b}",
+            "big stdout": "rm {a} {b}; head -c 50000 /dev/zero | tr '\\0' o",
+            "stderr to /dev/null": "rm {a} {b} 2>/dev/null",
+            "stderr merged into stdout": "rm {a} {b} 2>&1",
+            "all output discarded": "rm {a} {b} >/dev/null 2>&1",
+        }
+        for name, template in variants.items():
+            with self.subTest(name), _config_override(audit_body_max_bytes=1000):
+                a, b = cwd / f"{abs(hash(name))}_a", cwd / f"{abs(hash(name))}_b"
+                a.write_text("a")
+                b.write_text("b")
+                result = tool_shell("test:agent", template.format(a=a, b=b), name)
+                self.assertFalse(a.exists() or b.exists())
+                self.assertEqual(len(result["trash_ids"]), 2, result)
+                self.assertNotIn("SAG_TRASH", result["stdout"] + result["stderr"])
+                event = self._last_shell_event()
+                self.assertEqual(event["trash_id"], result["trash_ids"][0])
+                self.assertEqual(
+                    json.loads(event["params_json"])["trash_ids"], result["trash_ids"]
+                )
+                self.assertEqual({i["id"] for i in list_trash(limit=200) if i["id"] in result["trash_ids"]},
+                                 set(result["trash_ids"]))
+
+    def test_many_trash_ids_are_never_cut_in_half(self):
+        cwd = Path(config.shell_cwd)
+        for i in range(40):
+            (cwd / f"file_{i:02d}").write_text("x")
+        with _config_override(audit_body_max_bytes=300):
+            result = tool_shell("test:agent", "rm file_*", "many")
+        self.assertEqual(len(result["trash_ids"]), 40)
+        self.assertEqual(len(set(result["trash_ids"])), 40)
+        self.assertTrue(all(len(i) == 36 for i in result["trash_ids"]))
+
+    def test_a_command_cannot_forge_trash_ids(self):
+        cwd = Path(config.shell_cwd)
+        (cwd / "mine").write_text("x")
+        (cwd / "theirs").write_text("x")
+        tool_shell("other:agent", "rm theirs", "someone else deletes")
+        theirs = list_trash()[0]["id"]
+        result = tool_shell(
+            "test:agent",
+            f"echo 00000000-0000-0000-0000-000000000000 >> $SAG_TRASH_FILE; echo {theirs} >> $SAG_TRASH_FILE; "
+            f"echo not-an-id >> $SAG_TRASH_FILE; echo 'SAG_TRASH {theirs}' >&2; rm mine",
+            "forge",
+        )
+        self.assertEqual(len(result["trash_ids"]), 1)
+        self.assertNotIn(theirs, result["trash_ids"])
+        self.assertIn(f"SAG_TRASH {theirs}", result["stderr"])  # plain stderr text: neither parsed nor stripped
+
+    def test_trash_id_file_is_removed_after_every_call(self):
+        import glob
+
+        pattern = os.path.join(tempfile.gettempdir(), "sag-trash-*")
+        before = set(glob.glob(pattern))
+        tool_shell("test:agent", "echo hi", "no rm")
+        with self.assertRaises(CommandExecutionError):
+            tool_shell("test:agent", "   ", "empty")
+        self.assertEqual(set(glob.glob(pattern)), before)
+
+    def test_rm_wrapper_run_by_hand_still_prints_the_id(self):
+        victim = Path(config.shell_cwd) / "by_hand"
+        victim.write_text("x")
+        env = {k: v for k, v in os.environ.items() if k != "SAG_TRASH_FILE"}
+        env["SAG_AGENT_ID"] = "test:agent"
+        proc = subprocess.run(
+            [sys.executable, str(_ROOT / "wrappers" / "rm"), str(victim)], env=env, capture_output=True, text=True
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertRegex(proc.stderr, r"^SAG_TRASH [0-9a-f-]{36}$")
+        self.assertFalse(victim.exists())
+
+    def test_rm_accepts_gnu_long_options(self):
+        cwd = Path(config.shell_cwd)
+        (cwd / "d").mkdir()
+        (cwd / "d" / "f").write_text("x")
+        (cwd / "single").write_text("x")
+        result = tool_shell(
+            "test:agent",
+            "rm --force --recursive --verbose d missing; echo first=$?; rm --force missing; echo second=$?; "
+            "rm --no-preserve-root --one-file-system single; echo third=$?; rm --dir nothere; echo fourth=$?",
+            "long options",
+        )
+        self.assertIn("first=0", result["stdout"])
+        self.assertIn("second=0", result["stdout"])
+        self.assertIn("third=0", result["stdout"])
+        self.assertIn("fourth=1", result["stdout"])  # a missing operand without --force is still an error
+        self.assertFalse((cwd / "d").exists() or (cwd / "single").exists())
+        self.assertEqual(len(result["trash_ids"]), 2)
+
+    def test_rm_still_rejects_options_it_does_not_know(self):
+        result = tool_shell("test:agent", "rm --interactive=always x; echo rc=$?", "unknown option")
+        self.assertIn("rc=1", result["stdout"])
+        self.assertIn("unsupported option --interactive=always", result["stderr"])
+
+    def test_audit_body_also_keeps_stderr_when_stdout_is_huge(self):
+        with _config_override(audit_body_max_bytes=1000):
+            append_audit("test:agent", "hub_shell", "shell_exec", "x", "r", "FAILED",
+                         stdout="o" * 5000, stderr="error: kept\n")
+            body = get_audit_event(self._last_shell_event()["id"])
+        self.assertEqual(body["stderr"], "error: kept\n")
+        self.assertTrue(body["stdout"].endswith(TRUNCATED_MARK))
 
 
 class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
