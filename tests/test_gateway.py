@@ -433,6 +433,155 @@ class TestGatewayV2(unittest.TestCase):
         tool_restore_file("test:agent", items[0]["id"], "restore tree")
         self.assertEqual((d / "n.txt").read_text(encoding="utf-8"), "nested")
 
+    # ---- restore with overwrite
+
+    def test_restore_overwrite_undoes_a_write_in_place_and_is_itself_undoable(self):
+        path = Path(config.shell_cwd) / "conf.txt"
+        path.write_text("v1", encoding="utf-8")
+        inode = path.stat().st_ino
+        written = tool_write_file("test:agent", str(path), "v2", "overwrite")
+        self.assertEqual(tool_restore_file("test:agent", written["trash_id"], "undo")["status"], "FAILED")
+        res = tool_restore_file("test:agent", written["trash_id"], "undo", overwrite=True)
+        self.assertEqual(res["status"], "RESTORED")
+        self.assertEqual(path.read_text(encoding="utf-8"), "v1")
+        self.assertEqual(path.stat().st_ino, inode)  # rewritten in place, like hub_write_file
+        self.assertEqual(len(list_trash()), 1)  # the restored item is gone, the displaced v2 is in
+        again = tool_restore_file("test:agent", res["displaced_trash_id"], "redo", overwrite="true")
+        self.assertEqual(again["status"], "RESTORED")
+        self.assertEqual(path.read_text(encoding="utf-8"), "v2")
+
+    def test_restore_overwrite_replaces_a_directory(self):
+        d = Path(config.shell_cwd) / "tree"
+        d.mkdir()
+        (d / "old.txt").write_text("old", encoding="utf-8")
+        deleted = tool_delete_file("test:agent", str(d), "rm tree")
+        d.mkdir()
+        (d / "new.txt").write_text("new", encoding="utf-8")
+        res = tool_restore_file("test:agent", deleted["trash_id"], "back", overwrite=True)
+        self.assertEqual(res["status"], "RESTORED")
+        self.assertEqual((d / "old.txt").read_text(encoding="utf-8"), "old")
+        self.assertFalse((d / "new.txt").exists())
+        displaced = [i for i in list_trash() if i["id"] == res["displaced_trash_id"]]
+        self.assertTrue(displaced and displaced[0]["is_dir"])
+
+    def test_restore_without_overwrite_still_refuses(self):
+        path = Path(config.shell_cwd) / "a.txt"
+        path.write_text("v1", encoding="utf-8")
+        item_id = trash_put(path, source="delete_file", agent_id="test:agent")
+        path.write_text("v2", encoding="utf-8")
+        self.assertEqual(tool_restore_file("test:agent", item_id, "x", overwrite=False)["status"], "FAILED")
+        self.assertEqual(path.read_text(encoding="utf-8"), "v2")
+
+    # ---- the bin never ends up with orphans or lost rows
+
+    def test_failed_trash_put_leaves_no_orphan_and_keeps_the_file(self):
+        from sag import trash as trash_mod
+
+        path = Path(config.shell_cwd) / "keepme.txt"
+        path.write_text("data", encoding="utf-8")
+        with unittest.mock.patch.object(trash_mod, "_move", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                trash_put(path, source="delete_file", agent_id="test:agent")
+        self.assertEqual(path.read_text(encoding="utf-8"), "data")
+        trash_root = Path(config.db_path).resolve().parent / "trash"
+        self.assertEqual(list(trash_root.iterdir()) if trash_root.exists() else [], [])
+        self.assertEqual(list_trash(), [])
+
+    def test_trash_put_rolls_back_when_the_row_cannot_be_written(self):
+        from sag import trash as trash_mod
+
+        path = Path(config.shell_cwd) / "rollback.txt"
+        path.write_text("data", encoding="utf-8")
+        with unittest.mock.patch.object(trash_mod, "get_db_connection", side_effect=RuntimeError("db locked")):
+            with self.assertRaises(RuntimeError):
+                trash_put(path, source="delete_file", agent_id="test:agent")
+        self.assertEqual(path.read_text(encoding="utf-8"), "data")  # not lost: back where it was
+        trash_root = Path(config.db_path).resolve().parent / "trash"
+        self.assertEqual(list(trash_root.iterdir()) if trash_root.exists() else [], [])
+
+    def test_cross_device_copy_failing_halfway_removes_the_partial_payload(self):
+        import errno as _errno
+
+        from sag import trash as trash_mod
+
+        src = Path(config.shell_cwd) / "tree2"
+        src.mkdir()
+        (src / "f").write_text("x", encoding="utf-8")
+        dst = Path(config.shell_cwd) / "bin" / "payload"
+
+        def half_copy(s_, d_, symlinks=False):
+            Path(d_).mkdir(parents=True)
+            (Path(d_) / "partial").write_text("p", encoding="utf-8")
+            raise OSError(_errno.ENOSPC, "no space")
+
+        with unittest.mock.patch.object(trash_mod.os, "rename", side_effect=OSError(_errno.EXDEV, "cross")), \
+                unittest.mock.patch.object(trash_mod.shutil, "copytree", half_copy):
+            with self.assertRaises(OSError):
+                trash_mod._move(src, dst)
+        self.assertTrue((src / "f").exists())  # the source is untouched
+        self.assertFalse(os.path.lexists(dst))
+
+    def test_expired_item_whose_payload_cannot_be_removed_keeps_its_row(self):
+        from sag import trash as trash_mod
+
+        path = Path(config.shell_cwd) / "stuck.txt"
+        path.write_text("data", encoding="utf-8")
+        item_id = trash_put(path, source="delete_file", agent_id="test:agent")
+        with get_db_connection() as conn:
+            conn.execute("UPDATE trash_items SET expires_at = '2000-01-01T00:00:00+0000' WHERE id = ?;", (item_id,))
+            conn.commit()
+        with unittest.mock.patch.object(trash_mod.shutil, "rmtree", lambda *a, **k: None):
+            self.assertEqual(trash_mod.purge_expired_trash(), 0)
+            self.assertEqual(trash_mod.purge_trash_items([item_id]), 0)
+        self.assertEqual([i["id"] for i in list_trash()], [item_id])  # retried on the next pass
+        self.assertEqual(trash_mod.purge_expired_trash(), 1)
+        self.assertEqual(list_trash(), [])
+
+    # ---- .env
+
+    def test_env_file_accepts_export_inline_comments_and_quotes(self):
+        from sag.config import _load_env_file
+
+        env = Path(config.shell_cwd) / "test.env"
+        env.write_text(
+            "# a comment\n"
+            "SAGT_PORT=4180   # the port\n"
+            "export SAGT_HOST=127.0.0.1\n"
+            "SAGT_QUOTED=\"has # hash\" # trailing\n"
+            "SAGT_SINGLE='it is'\n"
+            "SAGT_URL=http://h/#frag\n"
+            "SAGT_EMPTY=\n"
+            "not a setting\n",
+            encoding="utf-8",
+        )
+        keys = ("SAGT_PORT", "SAGT_HOST", "SAGT_QUOTED", "SAGT_SINGLE", "SAGT_URL", "SAGT_EMPTY")
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            try:
+                _load_env_file(env)
+                self.assertEqual(int(os.environ["SAGT_PORT"]), 4180)
+                self.assertEqual(os.environ["SAGT_HOST"], "127.0.0.1")
+                self.assertEqual(os.environ["SAGT_QUOTED"], "has # hash")
+                self.assertEqual(os.environ["SAGT_SINGLE"], "it is")
+                self.assertEqual(os.environ["SAGT_URL"], "http://h/#frag")  # no whitespace before '#': not a comment
+                self.assertEqual(os.environ["SAGT_EMPTY"], "")
+            finally:
+                for k in keys:
+                    os.environ.pop(k, None)
+
+    def test_env_file_does_not_override_the_real_environment(self):
+        from sag.config import _load_env_file
+
+        env = Path(config.shell_cwd) / "test2.env"
+        env.write_text("SAGT_KEEP=from-file\n", encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ, {"SAGT_KEEP": "from-env"}):
+            _load_env_file(env)
+            self.assertEqual(os.environ["SAGT_KEEP"], "from-env")
+
+    def test_runtime_files_are_gitignored(self):
+        text = (Path(__file__).resolve().parent.parent / ".gitignore").read_text(encoding="utf-8")
+        for name in (".env", "data/", "SERVER_AGENTS.md"):
+            self.assertIn(name, text.split())
+
     def test_audit_redaction_in_shell_log(self):
         tok = "sag_cursor_helm_" + "ab12" * 12
         raw = (
@@ -1261,44 +1410,32 @@ class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
         self.assertLess(traced["peak"], 3_000_000)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "no named pipes on this platform")
-    def test_one_shot_pipe_is_read_from_its_first_byte(self):
+    def test_named_pipe_is_rejected_instead_of_blocking_a_worker(self):
         fifo = Path(config.shell_cwd) / "pipe"
-        os.mkfifo(fifo)
-
-        def writer():
-            with open(fifo, "wb") as w:
-                w.write(b"first\nsecond\n")
-
-        threading.Thread(target=writer, daemon=True).start()
+        os.mkfifo(fifo)  # nobody ever opens the other end: open() would block forever
         box = {}
 
         def reader():
             try:
                 box["res"] = tool_read_file("test:agent", str(fifo))
-            except Exception as exc:  # pragma: no cover - reported below
+            except Exception as exc:
                 box["exc"] = exc
 
         t = threading.Thread(target=reader, daemon=True)
         t.start()
         t.join(5)
         if t.is_alive():
-            for _ in range(2):  # release whatever is blocked in open(), then fail
-                try:
-                    os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
-                except OSError:
-                    pass
+            os.close(os.open(fifo, os.O_RDWR | os.O_NONBLOCK))  # release the blocked open(), then fail
             t.join(2)
-            self.fail("hub_read_file hung on a pipe that has a writer")
-        self.assertNotIn("exc", box, box.get("exc"))
-        self.assertEqual(box["res"]["content"], "first\nsecond\n")
+            self.fail("hub_read_file blocked on a pipe")
+        self.assertIsInstance(box.get("exc"), ValueError)
+        self.assertIn("not a regular file", str(box["exc"]))
+        self.assertEqual(query_audit_logs(action_type="file_read", limit=1)[0]["status"], "FAILED")
 
-    def test_audit_records_the_truncation(self):
-        path = self._file(self._lines(50))
-        with _config_override(read_max_bytes=100):
-            tool_read_file("test:agent", path)
-        row = query_audit_logs(action_type="file_read", limit=1)[0]
-        self.assertEqual(row["status"], "SUCCESS")
-        self.assertTrue(json.loads(row["params_json"])["truncated"])
+    @unittest.skipUnless(os.path.exists("/dev/zero"), "no /dev/zero")
+    def test_devices_are_rejected(self):
+        with self.assertRaises(ValueError):
+            tool_read_file("test:agent", "/dev/zero")
 
 
 class TestCredentials(unittest.TestCase):

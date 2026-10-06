@@ -72,6 +72,18 @@ def _dir_size(path: Path) -> int:
     return total
 
 
+def _remove_tree(path: Path) -> None:
+    """Remove a file, link or directory tree; whatever could not be removed stays (check lexists)."""
+    if os.path.lexists(path):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def _move(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -79,14 +91,21 @@ def _move(src: Path, dst: Path) -> None:
     except OSError as exc:
         if exc.errno != errno.EXDEV:
             raise
-        if src.is_symlink():
-            os.symlink(os.readlink(src), dst)
-            src.unlink()
-        elif src.is_dir():
-            shutil.copytree(src, dst, symlinks=True)
+        # Across devices: copy, then delete the source. A copy that fails halfway must not
+        # leave a partial destination behind (the source is still whole at that point).
+        try:
+            if src.is_symlink():
+                os.symlink(os.readlink(src), dst)
+            elif src.is_dir():
+                shutil.copytree(src, dst, symlinks=True)
+            else:
+                shutil.copy2(src, dst, follow_symlinks=False)
+        except BaseException:
+            _remove_tree(dst)
+            raise
+        if src.is_dir() and not src.is_symlink():
             shutil.rmtree(src)
         else:
-            shutil.copy2(src, dst, follow_symlinks=False)
             src.unlink()
 
 
@@ -113,49 +132,70 @@ def trash_put(
     trash_dir = Path(config.db_path).resolve().parent / "trash" / item_id
     payload = trash_dir / "payload"
     trash_dir.mkdir(parents=True, exist_ok=True)
-    if keep:
-        shutil.copy2(target, payload)
-    else:
-        _move(target, payload)
-    size_bytes = _dir_size(payload)
-    now = _now()
-    expires = now + timedelta(days=config.trash_retention_days)
-    rel = f"trash/{item_id}/payload"
-    meta = {
-        "id": item_id,
-        "original_path": str(target),
-        "stored_relpath": rel,
-        "deleted_by": agent_id,
-        "deleted_at": _iso(now),
-        "expires_at": _iso(expires),
-        "source": source,
-        "audit_id": audit_id,
-        "is_dir": is_dir,
-        "size_bytes": size_bytes,
-    }
-    (trash_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    with get_db_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO trash_items (
-                id, original_path, stored_relpath, deleted_by, deleted_at,
-                expires_at, source, audit_id, is_dir, size_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """,
-            (
-                item_id,
-                str(target),
-                rel,
-                agent_id,
-                meta["deleted_at"],
-                meta["expires_at"],
-                source,
-                audit_id,
-                1 if is_dir else 0,
-                size_bytes,
-            ),
-        )
-        conn.commit()
+    try:
+        if keep:
+            shutil.copy2(target, payload)
+        else:
+            _move(target, payload)
+    except BaseException:
+        # Nothing was stored (a failed copy removes its own partial payload): do not leave an
+        # orphan directory that no row points to and nothing will ever purge.
+        if not os.path.lexists(payload):
+            shutil.rmtree(trash_dir, ignore_errors=True)
+        raise
+    try:
+        size_bytes = _dir_size(payload)
+        now = _now()
+        expires = now + timedelta(days=config.trash_retention_days)
+        rel = f"trash/{item_id}/payload"
+        meta = {
+            "id": item_id,
+            "original_path": str(target),
+            "stored_relpath": rel,
+            "deleted_by": agent_id,
+            "deleted_at": _iso(now),
+            "expires_at": _iso(expires),
+            "source": source,
+            "audit_id": audit_id,
+            "is_dir": is_dir,
+            "size_bytes": size_bytes,
+        }
+        (trash_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO trash_items (
+                    id, original_path, stored_relpath, deleted_by, deleted_at,
+                    expires_at, source, audit_id, is_dir, size_bytes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    item_id,
+                    str(target),
+                    rel,
+                    agent_id,
+                    meta["deleted_at"],
+                    meta["expires_at"],
+                    source,
+                    audit_id,
+                    1 if is_dir else 0,
+                    size_bytes,
+                ),
+            )
+            conn.commit()
+    except BaseException:
+        # Could not record it (disk full, database locked): undo, so the caller's error is true
+        # and the file is still where it was. If moving it back fails too, the payload and its
+        # meta.json stay in the bin for a manual restore.
+        try:
+            if keep:
+                shutil.rmtree(trash_dir, ignore_errors=True)
+            elif not os.path.lexists(target):
+                _move(payload, target)
+                shutil.rmtree(trash_dir, ignore_errors=True)
+        except BaseException:
+            pass
+        raise
     return item_id
 
 
@@ -165,13 +205,18 @@ def list_trash(prefix: Optional[str] = None, limit: int = 50) -> List[Dict[str, 
     if prefix:
         sql += " WHERE original_path LIKE ?"
         params.append(prefix + "%")
-    sql += " ORDER BY deleted_at DESC LIMIT ?;"
+    sql += " ORDER BY deleted_at DESC, rowid DESC LIMIT ?;"
     params.append(max(1, min(int(limit), 200)))
     with get_db_connection() as conn:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
-def restore_trash(item_id: str) -> Dict[str, Any]:
+def restore_trash(item_id: str, overwrite: bool = False, agent_id: str = "unknown") -> Dict[str, Any]:
+    """
+    Put a recycle-bin item back at its original path. If something is there already this fails,
+    unless overwrite=True: then what is there now goes into the bin first (its id comes back as
+    displaced_trash_id), so undoing an overwrite is itself undoable.
+    """
     with get_db_connection() as conn:
         row = conn.execute("SELECT * FROM trash_items WHERE id = ?;", (item_id,)).fetchone()
         if not row:
@@ -181,28 +226,51 @@ def restore_trash(item_id: str) -> Dict[str, Any]:
     payload = Path(config.db_path).resolve().parent / item["stored_relpath"]
     if not os.path.lexists(payload):
         return {"status": "FAILED", "error": "payload missing"}
+    displaced = None
     if os.path.lexists(dest):
-        return {"status": "FAILED", "error": "destination exists", "path": str(dest)}
+        if not overwrite:
+            return {"status": "FAILED", "error": "destination exists", "path": str(dest)}
+        in_place = (
+            dest.is_file() and not dest.is_symlink() and payload.is_file() and not payload.is_symlink()
+        )
+        # A regular file is rewritten in place (same inode and owner, like hub_write_file); anything
+        # else (a directory, a link, a type change) is moved aside.
+        displaced = trash_put(dest, source="restore_overwrite", agent_id=agent_id, keep=in_place)
+        if in_place:
+            shutil.copyfile(payload, dest)
+            shutil.copymode(payload, dest)
+            _finish_restore(payload, item_id)
+            return {"status": "RESTORED", "path": str(dest), "trash_id": item_id, "displaced_trash_id": displaced}
     dest.parent.mkdir(parents=True, exist_ok=True)
     _move(payload, dest)
-    trash_dir = payload.parent
-    shutil.rmtree(trash_dir, ignore_errors=True)
+    _finish_restore(payload, item_id)
+    result = {"status": "RESTORED", "path": str(dest), "trash_id": item_id}
+    if displaced:
+        result["displaced_trash_id"] = displaced
+    return result
+
+
+def _finish_restore(payload: Path, item_id: str) -> None:
+    shutil.rmtree(payload.parent, ignore_errors=True)
     with get_db_connection() as conn:
         conn.execute("DELETE FROM trash_items WHERE id = ?;", (item_id,))
         conn.commit()
-    return {"status": "RESTORED", "path": str(dest), "trash_id": item_id}
 
 
 def purge_expired_trash() -> int:
     now = _iso(_now())
     with get_db_connection() as conn:
         rows = list(conn.execute("SELECT id, stored_relpath FROM trash_items WHERE expires_at <= ?;", (now,)))
+        purged = 0
         for row in rows:
             payload = Path(config.db_path).resolve().parent / row["stored_relpath"]
             shutil.rmtree(payload.parent, ignore_errors=True)
+            if os.path.lexists(payload.parent):
+                continue  # could not remove it: keep the row so the next pass retries
             conn.execute("DELETE FROM trash_items WHERE id = ?;", (row["id"],))
+            purged += 1
         conn.commit()
-        return len(rows)
+        return purged
 
 
 def select_trash(
@@ -246,6 +314,8 @@ def purge_trash_items(ids: List[str]) -> int:
                 continue
             payload = Path(config.db_path).resolve().parent / row["stored_relpath"]
             shutil.rmtree(payload.parent, ignore_errors=True)
+            if os.path.lexists(payload.parent):
+                continue  # could not remove it: keep the row (and do not count it)
             conn.execute("DELETE FROM trash_items WHERE id = ?;", (item_id,))
             n += 1
         conn.commit()

@@ -4,6 +4,7 @@ Supports environment variables and optional .env file.
 """
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,9 +17,16 @@ def _load_env_file(filepath: Path) -> None:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
             key, val = line.split("=", 1)
             key = key.strip()
-            val = val.strip().strip('"').strip("'")
+            val = val.strip()
+            if val[:1] in ('"', "'"):
+                end = val.find(val[0], 1)
+                val = val[1:end] if end != -1 else val[1:]  # quoted: everything inside, '#' included
+            else:
+                val = re.split(r"\s+#", val, maxsplit=1)[0].strip()  # `KEY=4180  # port`
             if key not in os.environ:
                 os.environ[key] = val
 

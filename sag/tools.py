@@ -198,11 +198,14 @@ def tool_read_file(
     if target.is_dir():
         exc = IsADirectoryError(str(target))
         _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
+    if not stat.S_ISREG(target.stat().st_mode):
+        # A named pipe without a writer would block this worker thread forever, /dev/zero never ends.
+        exc = ValueError(f"not a regular file: {target} (use hub_shell for pipes and devices)")
+        _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
     start = max(int(offset) - 1, 0)
     max_lines = None if limit is None else max(int(limit), 0)
     cap = max(1, config.read_max_bytes)
-    # One open, and peek() instead of read() for the binary check: it consumes nothing, so a
-    # pipe or other one-shot file is still read from its first byte.
+    # One open, and peek() for the binary check: it consumes nothing.
     with open(target, "rb") as f:
         binary = b"\x00" in f.peek(8192)[:8192]
         window = None if binary else _read_window(f, start, max_lines, cap)
@@ -549,8 +552,10 @@ def tool_list_trash(agent_id: str, prefix: Optional[str] = None, limit: int = 50
     return items
 
 
-def tool_restore_file(agent_id: str, trash_id: str, reason: str) -> Dict[str, Any]:
-    result = restore_trash(trash_id)
+def tool_restore_file(agent_id: str, trash_id: str, reason: str, overwrite: Any = False) -> Dict[str, Any]:
+    if isinstance(overwrite, str):  # some clients send booleans as strings
+        overwrite = overwrite.strip().lower() in ("1", "true", "yes", "y", "on")
+    result = restore_trash(trash_id, overwrite=bool(overwrite), agent_id=agent_id)
     status = "SUCCESS" if result.get("status") == "RESTORED" else "FAILED"
     append_audit(
         agent_id=agent_id,

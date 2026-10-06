@@ -32,7 +32,7 @@ MCP_TOOLS_SPEC = [
     {
         "name": "hub_read_file",
         "description": (
-            "Read a UTF-8 text file. Directories and binary files are rejected. "
+            "Read a UTF-8 text file. Directories, binary files, pipes and devices are rejected. "
             "Lines end at \\n. At most 2 MiB (by default) is returned per call; when `truncated` is true, "
             "call again with `offset` set to `next_offset`."
         ),
@@ -136,12 +136,17 @@ MCP_TOOLS_SPEC = [
     },
     {
         "name": "hub_restore_file",
-        "description": "Restore a recycle-bin item by trash_id. Fails if the original path already exists.",
+        "description": (
+            "Restore a recycle-bin item by trash_id. Fails if the original path already exists, unless "
+            "overwrite=true: the current file or directory then goes into the recycle bin first "
+            "(returned as displaced_trash_id), which is how you undo hub_write_file / hub_patch_file."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "trash_id": {"type": "string"},
                 "reason": {"type": "string"},
+                "overwrite": {"type": "boolean", "default": False},
             },
             "required": ["trash_id", "reason"],
         },
