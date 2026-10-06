@@ -207,6 +207,9 @@ def _migrate_v1_audit() -> None:
         conn.commit()
 
 
+_TRUNCATED_MARK = "\n[truncated]\n"
+
+
 def _clip_text(text: str, max_bytes: int) -> tuple[str, bool]:
     if not text:
         return text, False
@@ -214,7 +217,14 @@ def _clip_text(text: str, max_bytes: int) -> tuple[str, bool]:
     if len(raw) <= max_bytes:
         return text, False
     cut = raw[:max_bytes].decode("utf-8", errors="ignore")
-    return cut + "\n[truncated]\n", True
+    return cut + _TRUNCATED_MARK, True
+
+
+def _split_mark(text: str) -> tuple[str, bool]:
+    """A body that already ends with the truncation marker (the executor adds one) -> (body without it, True)."""
+    if text.endswith(_TRUNCATED_MARK):
+        return text[: -len(_TRUNCATED_MARK)], True
+    return text, False
 
 
 def append_audit(
@@ -245,18 +255,26 @@ def append_audit(
         safe_diff, _ = _clip_text(safe_diff, 64 * 1024)
     max_body = config.audit_body_max_bytes
     truncated = False
-    out = safe_stdout or ""
-    err = safe_stderr or ""
+    # Clip the content, not the marker: a body that arrives already marked must not be cut through its
+    # own marker (which left "\n[" fragments or two markers), and still counts as truncated.
+    out, out_marked = _split_mark(safe_stdout or "")
+    err, err_marked = _split_mark(safe_stderr or "")
     out_b = out.encode("utf-8")
     err_b = err.encode("utf-8")
     if len(out_b) + len(err_b) > max_body:
         truncated = True
         if len(out_b) > max_body:
             out, _ = _clip_text(out, max_body)
-            err = "\n[truncated]\n"
+            err = _TRUNCATED_MARK
         else:
             remain = max_body - len(out_b)
             err, _ = _clip_text(err, remain)
+    if out_marked or err_marked:
+        truncated = True
+        if out_marked and not out.endswith(_TRUNCATED_MARK):
+            out += _TRUNCATED_MARK
+        if err_marked and not err.endswith(_TRUNCATED_MARK):
+            err += _TRUNCATED_MARK
     output_bytes = len(out.encode("utf-8")) + len(err.encode("utf-8"))
     with get_db_connection() as conn:
         conn.execute(

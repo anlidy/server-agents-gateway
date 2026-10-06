@@ -8,7 +8,10 @@ import os
 import shutil
 import signal
 import sys
+import random
+import subprocess
 import tempfile
+import threading
 import time
 import tracemalloc
 import unittest
@@ -90,6 +93,27 @@ def _config_override(**values):
     finally:
         for k, v in old.items():
             object.__setattr__(config, k, v)
+
+
+@contextlib.contextmanager
+def _peak_traced_bytes():
+    """
+    Yields a dict that gets "peak": the most memory the block held on top of what was already live.
+    Leaves an already-running tracemalloc alone, so it also works under `python -X tracemalloc`.
+    """
+    outer = tracemalloc.is_tracing()
+    if outer:
+        tracemalloc.reset_peak()
+    else:
+        tracemalloc.start()
+    base = tracemalloc.get_traced_memory()[0]
+    box = {}
+    try:
+        yield box
+    finally:
+        box["peak"] = tracemalloc.get_traced_memory()[1] - base
+        if not outer:
+            tracemalloc.stop()
 
 
 class TestGatewayV2(unittest.TestCase):
@@ -770,6 +794,17 @@ class _ScratchCwdMixin:
                 shutil.rmtree(child)
             else:
                 child.unlink()
+        # Cleanups run last-in first-out and after tearDown: registered here, this one runs after every
+        # _kill_pid_file cleanup, which still need to read their pid files.
+        self.addCleanup(self._empty_scratch_cwd)
+
+    @staticmethod
+    def _empty_scratch_cwd():
+        for child in list(Path(config.shell_cwd).iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
 
     def tearDown(self):
         _wipe_db()
@@ -784,7 +819,12 @@ class _ScratchCwdMixin:
         self.addCleanup(kill)
 
     def _last_shell_event(self):
-        return query_audit_logs(action_type="shell_exec", limit=1)[0]
+        # newest by rowid: timestamps only have one-second resolution
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM audit_events WHERE action_type = 'shell_exec' ORDER BY rowid DESC LIMIT 1;"
+            ).fetchone()
+        return dict(row)
 
     @staticmethod
     def _is_running(pid):
@@ -793,8 +833,12 @@ class _ScratchCwdMixin:
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
+        if not Path("/proc/self").exists():
+            return True  # no /proc (not Linux): kill -0 is all we have
         try:
             state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            return False  # it vanished between the two calls
         except (OSError, IndexError):
             return True
         return state != "Z"
@@ -861,13 +905,9 @@ class TestShellOutput(_ScratchCwdMixin, unittest.TestCase):
 
     def test_large_output_is_capped_without_buffering_it(self):
         cap = 100_000
-        with _config_override(audit_body_max_bytes=cap):
-            tracemalloc.start()
-            try:
-                code, stdout, stderr, truncated = execute_shell("head -c 30000000 /dev/zero | tr '\\0' a")
-                _, peak = tracemalloc.get_traced_memory()
-            finally:
-                tracemalloc.stop()
+        with _config_override(audit_body_max_bytes=cap), _peak_traced_bytes() as traced:
+            code, stdout, stderr, truncated = execute_shell("head -c 30000000 /dev/zero | tr '\\0' a")
+        peak = traced["peak"]
         self.assertEqual(code, 0)
         self.assertTrue(truncated)
         self.assertLessEqual(len(stdout.encode("utf-8")), cap + len("\n[truncated]\n"))
@@ -892,11 +932,24 @@ class TestShellOutput(_ScratchCwdMixin, unittest.TestCase):
         self.assertEqual(len(stderr), 500_000)
 
     def test_stdin_is_closed(self):
-        started = time.monotonic()
-        result = tool_shell("test:agent", "cat; echo done", "reads stdin")
+        # Make fd 0 a pipe that neither delivers data nor EOF: a child that inherited it would wait out the timeout.
+        try:
+            saved = os.dup(0)
+        except OSError:
+            self.skipTest("test process has no stdin to replace")
+        r, w = os.pipe()
+        try:
+            os.dup2(r, 0)
+            started = time.monotonic()
+            result = tool_shell("test:agent", "cat; echo done", "reads stdin")
+            elapsed = time.monotonic() - started
+        finally:
+            os.dup2(saved, 0)
+            for fd in (saved, r, w):
+                os.close(fd)
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["stdout"], "done\n")
-        self.assertLess(time.monotonic() - started, 4)
+        self.assertLess(elapsed, 4)
 
     def test_output_before_a_timeout_is_kept(self):
         started = time.monotonic()
@@ -908,6 +961,7 @@ class TestShellOutput(_ScratchCwdMixin, unittest.TestCase):
         self.assertEqual(self._last_shell_event()["status"], "FAILED")
 
     def test_background_job_sharing_the_pipes_is_killed_at_timeout(self):
+        self._kill_pid_file("bgpid")
         started = time.monotonic()
         result = tool_shell(
             "test:agent", "sleep 30 & echo $! > bgpid; echo started", "forgot to redirect", timeout_seconds=1
@@ -916,19 +970,18 @@ class TestShellOutput(_ScratchCwdMixin, unittest.TestCase):
         self.assertEqual(result["exit_code"], -1)
         self.assertEqual(result["stdout"], "started\n")
         self.assertNotIn("still holds", result["stderr"])
-        self._kill_pid_file("bgpid")
         pid = int((Path(config.shell_cwd) / "bgpid").read_text().strip())
         time.sleep(0.2)
         self.assertFalse(self._is_running(pid))  # same process group: gone with the shell
 
     @unittest.skipUnless(shutil.which("setsid"), "setsid not installed")
     def test_detached_process_holding_the_pipes_cannot_hang_the_call(self):
+        self._kill_pid_file("bgpid")
         started = time.monotonic()
         result = tool_shell(
             "test:agent", "setsid sleep 15 & echo $! > bgpid; sleep 30", "detached daemon", timeout_seconds=1
         )
         elapsed = time.monotonic() - started
-        self._kill_pid_file("bgpid")
         # Before: communicate() waited on the pipe the detached sleep kept open (15 s here, forever for a daemon).
         self.assertLess(elapsed, 6)
         self.assertEqual(result["exit_code"], -1)
@@ -938,16 +991,127 @@ class TestShellOutput(_ScratchCwdMixin, unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("setsid"), "setsid not installed")
     def test_redirected_background_job_returns_at_once_and_survives(self):
+        self._kill_pid_file("bgpid")
         started = time.monotonic()
         result = tool_shell(
             "test:agent", "setsid nohup sleep 15 >/dev/null 2>&1 & echo $! > bgpid; echo started", "proper daemon"
         )
-        self._kill_pid_file("bgpid")
         self.assertLess(time.monotonic() - started, 4)
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["stdout"], "started\n")
         pid = int((Path(config.shell_cwd) / "bgpid").read_text().strip())
         self.assertTrue(self._is_running(pid))
+
+
+    def test_large_stderr_is_capped_without_buffering_it(self):
+        with _config_override(audit_body_max_bytes=100_000), _peak_traced_bytes() as traced:
+            code, stdout, stderr, truncated = execute_shell("head -c 30000000 /dev/zero | tr '\\0' e >&2")
+        self.assertEqual(code, 0)
+        self.assertTrue(truncated)
+        self.assertTrue(stderr.endswith("[truncated]\n"))
+        self.assertLess(traced["peak"], 8_000_000)
+
+    def test_a_stream_that_lost_bytes_is_marked_exactly_once(self):
+        scenarios = {
+            "stdout only": "head -c 5000 /dev/zero | tr '\\0' a",
+            "stderr only": "head -c 50 /dev/zero | tr '\\0' a; head -c 5000 /dev/zero | tr '\\0' b >&2",
+            "both": "head -c 5000 /dev/zero | tr '\\0' a; head -c 5000 /dev/zero | tr '\\0' b >&2",
+            "stderr overflows what stdout left": "head -c 995 /dev/zero | tr '\\0' a; head -c 5000 /dev/zero | tr '\\0' b >&2",
+            # CRLF shrinks the kept 1000 raw bytes to 800 characters: it fits the cap again but bytes were lost
+            "crlf shrinks below the cap": "for i in $(seq 400); do printf 'abc\\r\\n'; done",
+        }
+        for name, command in scenarios.items():
+            with self.subTest(name), _config_override(audit_body_max_bytes=1000):
+                code, stdout, stderr, truncated = execute_shell(command)
+                self.assertTrue(truncated)
+                for stream in (stdout, stderr):
+                    self.assertLessEqual(stream.count("[truncated]"), 1)
+                    # nothing but the whole marker may contain a bracket: no cut-off fragments
+                    self.assertNotIn("[", stream.replace("\n[truncated]\n", ""))
+                self.assertTrue(stdout.endswith("[truncated]\n") or stderr.endswith("[truncated]\n"))
+                if name in ("stdout only", "both", "crlf shrinks below the cap"):
+                    self.assertEqual(stdout.count("[truncated]"), 1)
+                if name in ("stderr only", "both", "stderr overflows what stdout left"):
+                    self.assertEqual(stderr.count("[truncated]"), 1)
+
+    def test_marker_is_clean_in_the_result_and_in_the_audit_body(self):
+        cases = {
+            # the cap lands inside a 3-byte character, so the kept text is 1-2 bytes short of the cap
+            "3-byte characters at the cap": "for i in $(seq 700); do printf '\\xe4\\xbd\\xa0'; done",
+            "crlf shrinks the kept bytes": "printf 'ab\\r\\n%.0s' $(seq 12); head -c 3000 /dev/zero | tr '\\0' z",
+            "ascii": "head -c 5000 /dev/zero | tr '\\0' a",
+        }
+        for name, command in cases.items():
+            with self.subTest(name), _config_override(audit_body_max_bytes=1000):
+                result = tool_shell("test:agent", command, name)
+                event = self._last_shell_event()
+                body = get_audit_event(event["id"])
+                self.assertTrue(result["truncated"])
+                self.assertEqual(event["truncated"], 1)
+                for where, text in (("result", result["stdout"]), ("audit body", body["stdout"])):
+                    self.assertEqual(text.count("[truncated]"), 1, where)
+                    self.assertTrue(text.endswith("\n[truncated]\n"), where)
+                    self.assertNotIn("[", text.replace("\n[truncated]\n", ""), where)  # no cut-off fragment
+                    self.assertNotIn("\n\n[truncated]", text, where)
+
+    def test_audit_keeps_an_existing_marker_and_flags_it(self):
+        with _config_override(audit_body_max_bytes=1000):
+            append_audit("test:agent", "hub_shell", "shell_exec", "x", "r", "SUCCESS",
+                         stdout="a" * 990 + "\n[truncated]\n", stderr="b\n[truncated]\n")
+            event = self._last_shell_event()
+        body = get_audit_event(event["id"])
+        self.assertEqual(body["stdout"], "a" * 990 + "\n[truncated]\n")
+        self.assertEqual(body["stderr"], "b\n[truncated]\n")
+        self.assertEqual(event["truncated"], 1)
+
+    def test_nothing_lost_means_no_marker(self):
+        with _config_override(audit_body_max_bytes=1000):
+            code, stdout, stderr, truncated = execute_shell("head -c 1000 /dev/zero | tr '\\0' a")
+        self.assertFalse(truncated)
+        self.assertEqual(stdout, "a" * 1000)
+        self.assertEqual(stderr, "")
+
+    def test_non_string_command_is_audited(self):
+        with self.assertRaises(Exception):
+            tool_shell("test:agent", 123, "not a string")
+        event = self._last_shell_event()
+        self.assertEqual(event["status"], "ERROR")
+        self.assertEqual(event["target"], "123")
+
+    def test_shell_is_killed_and_pipes_closed_if_supervision_fails(self):
+        spawned = []
+        real_popen = subprocess.Popen
+
+        def spy(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        # e.g. the gateway is out of file descriptors right after the shell started
+        broken = unittest.mock.Mock(side_effect=OSError(24, "Too many open files"))
+        with unittest.mock.patch("sag.executor.subprocess.Popen", spy), \
+                unittest.mock.patch("sag.executor.selectors.PollSelector", broken), \
+                unittest.mock.patch("sag.executor.selectors.DefaultSelector", broken):
+            with self.assertRaises(OSError):
+                execute_shell("sleep 20")
+        (proc,) = spawned
+        self.assertIsNotNone(proc.poll())  # killed and reaped, not left running
+        self.assertTrue(proc.stdout.closed and proc.stderr.closed)
+
+    @unittest.skipUnless(hasattr(__import__("selectors"), "PollSelector"), "no poll() on this platform")
+    def test_supervision_uses_poll_which_needs_no_new_file_descriptor(self):
+        import selectors
+
+        real = selectors.PollSelector
+        used = []
+
+        def spy():
+            used.append(True)
+            return real()
+
+        with unittest.mock.patch("sag.executor.selectors.PollSelector", spy):
+            execute_shell("echo hi")
+        self.assertTrue(used)
 
 
 class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
@@ -979,17 +1143,40 @@ class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
         path = self._file("a\rb\nc\x0cd\ne\n")
         self.assertEqual(tool_read_file("test:agent", path, offset=2, limit=1)["content"], "c\x0cd\n")
 
-    def test_cap_in_the_middle_of_a_line(self):
+    def test_cap_in_the_middle_of_a_line_leaves_that_line_whole_for_the_next_page(self):
         path = self._file(self._lines(50))
         with _config_override(read_max_bytes=100):
             first = tool_read_file("test:agent", path)
             self.assertTrue(first["truncated"])
-            self.assertEqual(len(first["content"].encode()), 100)
-            self.assertTrue(first["content"].startswith("line 01\nline 02\n"))
-            self.assertTrue(first["content"].endswith("line"))  # 12 full lines + 4 bytes of line 13
-            self.assertEqual(first["next_offset"], 14)
+            self.assertEqual(first["content"], self._lines(12))  # 96 bytes; line 13 would end at byte 104
+            self.assertEqual(first["next_offset"], 13)
             second = tool_read_file("test:agent", path, offset=first["next_offset"])
-        self.assertTrue(second["content"].startswith("line 14\n"))
+        self.assertTrue(second["content"].startswith("line 13\n"))
+
+    def test_following_next_offset_reassembles_the_file(self):
+        rnd = random.Random(7)
+        for case in range(60):
+            lines = ["".join(rnd.choice("ab \u00e9\u4f60") for _ in range(rnd.choice([0, 1, 5, 20, 60]))) + "\n"
+                     for _ in range(rnd.randint(0, 40))]
+            if lines and rnd.random() < 0.3:
+                lines[-1] = lines[-1].rstrip("\n")  # no trailing newline
+            text = "".join(lines)
+            path = self._file(text, f"p{case}.txt")
+            longest = max((len(line.encode()) for line in lines), default=1)
+            cap = max(longest, rnd.choice([1, 8, 40, 100, 257]))  # a cap below the longest line is covered separately
+            pages, offset = [], 1
+            with _config_override(read_max_bytes=cap):
+                for _ in range(len(lines) + 2):
+                    res = tool_read_file("test:agent", path, offset=offset)
+                    self.assertLessEqual(len(res["content"].encode()), cap)
+                    pages.append(res["content"])
+                    if not res.get("truncated"):
+                        break
+                    self.assertGreater(res["next_offset"], offset)
+                    offset = res["next_offset"]
+                else:
+                    self.fail("paging never finished")
+            self.assertEqual("".join(pages), text, f"case {case}, cap {cap}")
 
     def test_cap_exactly_at_a_line_boundary(self):
         path = self._file(self._lines(50))
@@ -1016,6 +1203,7 @@ class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
             self.assertEqual(first["content"], "x" * 1000)
             self.assertTrue(first["truncated"])
             self.assertEqual(first["next_offset"], 2)
+            self.assertIn("longer than", first["note"])
             self.assertEqual(tool_read_file("test:agent", path, offset=2, limit=1)["content"], "second\n")
             self.assertEqual(tool_read_file("test:agent", path, offset=3)["content"], "third\n")
 
@@ -1031,23 +1219,77 @@ class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
         with open(path, "wb") as f:
             for _ in range(200):
                 f.write((b"y" * 99 + b"\n") * 1000)  # 20 MB
-        tracemalloc.start()
-        try:
-            with _config_override(read_max_bytes=50_000):
-                res = tool_read_file("test:agent", str(path), offset=150_000, limit=10)
-            _, peak = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
+        with _config_override(read_max_bytes=50_000), _peak_traced_bytes() as traced:
+            res = tool_read_file("test:agent", str(path), offset=150_000, limit=10)
         self.assertEqual(res["content"], ("y" * 99 + "\n") * 10)
-        self.assertLess(peak, 5_000_000)
+        self.assertLess(traced["peak"], 5_000_000)
 
     def test_binary_and_invalid_utf8_are_still_rejected_and_audited(self):
         with self.assertRaises(ValueError):
             tool_read_file("test:agent", self._file(b"\x00abc"))
-        with self.assertRaises(UnicodeDecodeError):
+        with self.assertRaises(ValueError):
             tool_read_file("test:agent", self._file(b"ok\xff\n", "bad.txt"))
         rows = query_audit_logs(action_type="file_read", limit=2)
         self.assertEqual([r["status"] for r in rows], ["FAILED", "FAILED"])
+
+    def test_invalid_utf8_error_names_the_line_in_the_file(self):
+        path = self._file(b"ok\nfine\nbad\xff\nafter\n")
+        with self.assertRaises(ValueError) as ctx:
+            tool_read_file("test:agent", path, offset=2)
+        self.assertIn("line 3", str(ctx.exception))
+        self.assertIn("0xff", str(ctx.exception))
+        row = query_audit_logs(action_type="file_read", limit=1)[0]
+        self.assertEqual(row["status"], "FAILED")
+        self.assertEqual(json.loads(row["params_json"])["invalid_utf8_line"], 3)
+        # the bad line is outside this window, so the read succeeds
+        self.assertEqual(tool_read_file("test:agent", path, offset=1, limit=2)["content"], "ok\nfine\n")
+
+    def test_skipping_lines_around_the_64k_chunk_boundary(self):
+        for length in (65534, 65535, 65536, 65537, 131071, 131072, 131073):
+            with self.subTest(length=length):
+                path = self._file("x" * length + "\ny\n" + "second\n", f"l{length}.txt")
+                self.assertEqual(tool_read_file("test:agent", path, offset=2, limit=1)["content"], "y\n")
+                self.assertEqual(tool_read_file("test:agent", path, offset=3)["content"], "second\n")
+                self.assertEqual(tool_read_file("test:agent", path, offset=4)["content"], "")
+
+    def test_skipping_a_huge_line_does_not_load_it(self):
+        path = self._file("z" * 20_000_000 + "\nnext\n")
+        with _peak_traced_bytes() as traced:
+            res = tool_read_file("test:agent", path, offset=2)
+        self.assertEqual(res["content"], "next\n")
+        self.assertLess(traced["peak"], 3_000_000)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no named pipes on this platform")
+    def test_one_shot_pipe_is_read_from_its_first_byte(self):
+        fifo = Path(config.shell_cwd) / "pipe"
+        os.mkfifo(fifo)
+
+        def writer():
+            with open(fifo, "wb") as w:
+                w.write(b"first\nsecond\n")
+
+        threading.Thread(target=writer, daemon=True).start()
+        box = {}
+
+        def reader():
+            try:
+                box["res"] = tool_read_file("test:agent", str(fifo))
+            except Exception as exc:  # pragma: no cover - reported below
+                box["exc"] = exc
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        t.join(5)
+        if t.is_alive():
+            for _ in range(2):  # release whatever is blocked in open(), then fail
+                try:
+                    os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:
+                    pass
+            t.join(2)
+            self.fail("hub_read_file hung on a pipe that has a writer")
+        self.assertNotIn("exc", box, box.get("exc"))
+        self.assertEqual(box["res"]["content"], "first\nsecond\n")
 
     def test_audit_records_the_truncation(self):
         path = self._file(self._lines(50))

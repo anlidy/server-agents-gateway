@@ -82,25 +82,30 @@ def _collect(proc: subprocess.Popen, out: _Capture, err: _Capture, timeout: int)
     """
     Read both pipes until EOF, then reap the shell, all within `timeout` seconds.
     On timeout the whole process group is killed, but we only wait a moment for
-    the pipes to close: a detached process (setsid, double fork) can outlive the
-    kill and keep them open, and must not keep this call, or its worker thread, alive.
+    the pipes to close: a process that left the group (setsid, or a `set -m` job)
+    can outlive the kill and keep them open, and must not keep this call, or its
+    worker thread, alive.
     Returns (timed_out, pipes_still_held).
     """
     deadline = time.monotonic() + timeout
-    sel = selectors.DefaultSelector()
-    sel.register(proc.stdout, selectors.EVENT_READ, out)
-    sel.register(proc.stderr, selectors.EVENT_READ, err)
-
-    def pump(wait: float) -> None:
-        for key, _ in sel.select(max(wait, 0.0)):
-            data = os.read(key.fd, _READ_CHUNK)
-            if data:
-                key.data.feed(data)
-            else:
-                sel.unregister(key.fileobj)
-
+    # poll() needs no new file descriptor, epoll does: a gateway sitting at its fd limit must not
+    # fail between spawning the shell and reading from it.
+    selector_class = getattr(selectors, "PollSelector", selectors.DefaultSelector)
+    sel = None
     timed_out = False
     try:
+        sel = selector_class()
+        sel.register(proc.stdout, selectors.EVENT_READ, out)
+        sel.register(proc.stderr, selectors.EVENT_READ, err)
+
+        def pump(wait: float) -> None:
+            for key, _ in sel.select(max(wait, 0.0)):
+                data = os.read(key.fd, _READ_CHUNK)
+                if data:
+                    key.data.feed(data)
+                else:
+                    sel.unregister(key.fileobj)
+
         while sel.get_map():
             left = deadline - time.monotonic()
             if left <= 0:
@@ -123,7 +128,8 @@ def _collect(proc: subprocess.Popen, out: _Capture, err: _Capture, timeout: int)
                 pass
         held = bool(sel.get_map())
     finally:
-        sel.close()
+        if sel is not None:
+            sel.close()
         for pipe in (proc.stdout, proc.stderr):
             try:
                 pipe.close()
@@ -174,13 +180,18 @@ def execute_shell(
     )
     cap = config.audit_body_max_bytes
     out, err = _Capture(cap), _Capture(cap)
-    timed_out, pipes_held = _collect(proc, out, err, timeout)
+    try:
+        timed_out, pipes_held = _collect(proc, out, err, timeout)
+    except BaseException:
+        # Whatever breaks while supervising, the shell must not keep running unsupervised.
+        _kill_group(proc)
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        raise
 
     stdout, stderr = out.text(), err.text()
-    if out.dropped:
-        stdout += _TRUNCATED_MARK
-    if err.dropped:
-        stderr += _TRUNCATED_MARK
     if timed_out:
         code = -1
         stderr += f"\nCommand timed out after {timeout}s"
@@ -189,4 +200,10 @@ def execute_shell(
     else:
         code = proc.returncode if proc.returncode is not None else -1
     stdout, stderr, clipped = clip_output(stdout, stderr, cap)
+    # A stream that lost bytes while being read must say so even when what is left still fits
+    # under the cap after decoding (clip_output has already marked the ones it cut itself).
+    if out.dropped and not stdout.endswith(_TRUNCATED_MARK):
+        stdout += _TRUNCATED_MARK
+    if err.dropped and not stderr.endswith(_TRUNCATED_MARK):
+        stderr += _TRUNCATED_MARK
     return code, stdout, stderr, clipped or out.dropped or err.dropped

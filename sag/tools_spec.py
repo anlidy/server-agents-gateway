@@ -193,7 +193,7 @@ MCP_TOOLS_SPEC = [
                 "target": {"type": "string"},
                 "action_type": {"type": "string"},
                 "tool_name": {"type": "string"},
-                "status": {"type": "string", "enum": ["SUCCESS", "FAILED", "REJECTED"]},
+                "status": {"type": "string", "enum": ["SUCCESS", "FAILED", "REJECTED", "ERROR"]},
                 "keyword": {"type": "string"},
                 "limit": {"type": "integer", "default": 20},
                 "offset": {"type": "integer", "default": 0},
