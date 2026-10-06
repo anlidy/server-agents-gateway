@@ -6,18 +6,17 @@ Primary endpoint is POST /mcp (Streamable HTTP, stateless); legacy HTTP+SSE
 """
 
 import asyncio
+import inspect
 import json
-import os
 import sys
-import time
 import urllib.parse
 import uuid
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional
 
 from . import collab
 from .auth import authenticate_bearer_token, issue_agent_token
 from .config import config
-from .db import init_db
+from .db import append_audit, init_db
 from .overview import ensure_document
 from .reconciler import reconcile
 from .tools import (
@@ -56,80 +55,158 @@ _SPOOF_KEYS = ("from", "from_agent", "sender", "created_by", "agent_id")
 _SENDER_TOOLS = {"hub_send_message", "hub_reply", "hub_create_task", "hub_update_task", "hub_set_group"}
 
 
+class UnknownToolError(ValueError):
+    """The tool does not exist, or exists but is not for this caller (the client cannot tell which)."""
+
+
+class ToolArgumentError(ValueError):
+    """The arguments do not fit the tool: missing, unexpected, or an attempt to set the sender."""
+
+
 def _reject_spoofing(tool_name: str, args: Dict[str, Any]) -> None:
     bad = [k for k in _SPOOF_KEYS if k in args]
     if bad:
-        raise ValueError(
+        raise ToolArgumentError(
             f"{tool_name}: '{bad[0]}' is not accepted; the sender is always the agent_id of your token"
         )
 
 
-def dispatch_tool(agent_id: str, role: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
-    # Strict isolation: if tool is admin-only, deny callers other than the configured root admin as unknown tools
-    if tool_name in ADMIN_ONLY_TOOL_NAMES:
-        if agent_id != config.root_admin_agent_id or role != "admin":
-            raise ValueError(f"Unknown MCP tool: {tool_name}")
+def _audit_event(**args: Any) -> Any:
+    return tool_get_audit_event(args.get("id") or args.get("event_id"))
+
+
+def _read_message(agent_id: str, **args: Any) -> Any:
+    message_id = args.pop("message_id", None)
+    alias = args.pop("id", None)
+    return collab.read_message(agent_id, message_id or alias, **args)
+
+
+# tool name -> (function, how it is called)
+#   "agent":    fn(agent_id, **args)             "agent_kw": fn(agent_id=agent_id, **args)
+#   "plain":    fn(**args)                       "none":     fn()   (arguments are ignored)
+#   "admin":    fn(caller_agent_id=..., caller_role=..., **args)
+_TOOL_TABLE = {
+    "hub_shell": (tool_shell, "agent"),
+    "hub_read_file": (tool_read_file, "agent"),
+    "hub_list_dir": (tool_list_dir, "agent"),
+    "hub_mkdir": (tool_mkdir, "agent"),
+    "hub_write_file": (tool_write_file, "agent"),
+    "hub_patch_file": (tool_patch_file, "agent"),
+    "hub_delete_file": (tool_delete_file, "agent"),
+    "hub_list_trash": (tool_list_trash, "agent"),
+    "hub_restore_file": (tool_restore_file, "agent"),
+    "hub_get_overview": (tool_get_overview, "plain"),
+    "hub_rebuild_overview": (tool_rebuild_overview, "agent_kw"),
+    "hub_get_status": (tool_get_status, "none"),
+    "hub_query_audit_logs": (tool_query_audit_logs, "plain"),
+    "hub_get_audit_event": (_audit_event, "plain"),
+    "hub_list_agents": (collab.list_agents, "agent"),
+    "hub_set_group": (collab.set_group, "agent"),
+    "hub_send_message": (collab.send_message, "agent"),
+    "hub_reply": (collab.reply, "agent"),
+    "hub_inbox": (collab.inbox, "agent"),
+    "hub_read_message": (_read_message, "agent"),
+    "hub_mark_read": (collab.mark_read, "agent"),
+    "hub_create_task": (collab.create_task, "agent"),
+    "hub_list_tasks": (collab.list_tasks, "agent"),
+    "hub_update_task": (collab.update_task, "agent"),
+    "hub_issue_agent_token": (tool_issue_agent_token, "admin"),
+    "hub_revoke_agent_token": (tool_revoke_agent_token, "admin"),
+}
+
+
+def _short(value: Any, limit: int = 500) -> Any:
+    """An argument as it goes into the audit row: scalars as they are, anything bigger cut to `limit` chars."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    try:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=repr)
+    except Exception:
+        text = repr(value)
+    return text if len(text) <= limit else f"{text[:limit]}...({len(text)} chars)"
+
+
+def _summarize_args(arguments: Any) -> Dict[str, Any]:
+    if not isinstance(arguments, dict):
+        return {"arguments": _short(arguments)}
+    return {str(k)[:80]: _short(v) for k, v in list(arguments.items())[:50]}
+
+
+def _failure_target(tool_name: Any, args: Dict[str, Any]) -> str:
+    for key in ("path", "command", "trash_id", "task_id", "message_id", "to", "agent_id"):
+        if args.get(key):
+            return str(_short(args[key], 200))[:200]
+    return str(tool_name)[:200]
+
+
+def _audit_failure(agent_id: str, tool_name: Any, arguments: Any, exc: BaseException) -> None:
+    """Record a call that failed without leaving a row of its own. Never raises: the caller's error wins."""
+    rejected = isinstance(exc, (UnknownToolError, ToolArgumentError, PermissionError))
+    args = arguments if isinstance(arguments, dict) else {}
+    try:
+        append_audit(
+            agent_id=agent_id,
+            tool_name=str(tool_name)[:100],
+            action_type="tool_rejected" if rejected else "tool_error",
+            target=_failure_target(tool_name, args),
+            reason=str(_short(args.get("reason") or "", 500)),
+            status="REJECTED" if rejected else "FAILED",
+            params=_summarize_args(arguments),
+            stderr=getattr(exc, "audit_detail", None) or f"{type(exc).__name__}: {exc}",
+        )
+    except Exception as audit_exc:
+        print(
+            f"[audit] could not record failed call {str(tool_name)[:100]!r} by {agent_id}: "
+            f"{type(audit_exc).__name__}: {audit_exc}",
+            file=sys.stderr,
+        )
+
+
+def _dispatch(agent_id: str, role: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
+    entry = _TOOL_TABLE.get(tool_name) if isinstance(tool_name, str) else None
+    if entry is None:
+        raise UnknownToolError(f"Unknown MCP tool: {tool_name}")
+    # Strict isolation: an admin-only tool is "unknown" to everyone but the configured root admin
+    if tool_name in ADMIN_ONLY_TOOL_NAMES and (agent_id != config.root_admin_agent_id or role != "admin"):
+        exc = UnknownToolError(f"Unknown MCP tool: {tool_name}")
+        exc.audit_detail = "admin-only tool called by an agent that is not the root admin"
+        raise exc
+    if arguments is not None and not isinstance(arguments, dict):
+        raise ToolArgumentError(f"{tool_name}: arguments must be an object")
 
     # Filter out client-side synthetic kwargs (e.g. Operit internal metadata)
-    cleaned_args = {k: v for k, v in (arguments or {}).items() if not k.startswith("__")}
+    args = {k: v for k, v in (arguments or {}).items() if not str(k).startswith("__")}
     if tool_name in _SENDER_TOOLS:
-        _reject_spoofing(tool_name, cleaned_args)
+        _reject_spoofing(tool_name, args)
 
-    if tool_name == "hub_shell":
-        return tool_shell(agent_id, **cleaned_args)
-    elif tool_name == "hub_read_file":
-        return tool_read_file(agent_id, **cleaned_args)
-    elif tool_name == "hub_list_dir":
-        return tool_list_dir(agent_id, **cleaned_args)
-    elif tool_name == "hub_mkdir":
-        return tool_mkdir(agent_id, **cleaned_args)
-    elif tool_name == "hub_write_file":
-        return tool_write_file(agent_id, **cleaned_args)
-    elif tool_name == "hub_patch_file":
-        return tool_patch_file(agent_id, **cleaned_args)
-    elif tool_name == "hub_delete_file":
-        return tool_delete_file(agent_id, **cleaned_args)
-    elif tool_name == "hub_list_trash":
-        return tool_list_trash(agent_id, **cleaned_args)
-    elif tool_name == "hub_restore_file":
-        return tool_restore_file(agent_id, **cleaned_args)
-    elif tool_name == "hub_get_overview":
-        return tool_get_overview(**cleaned_args)
-    elif tool_name == "hub_rebuild_overview":
-        return tool_rebuild_overview(**cleaned_args)
-    elif tool_name == "hub_get_status":
-        return tool_get_status()
-    elif tool_name == "hub_query_audit_logs":
-        return tool_query_audit_logs(**cleaned_args)
-    elif tool_name == "hub_get_audit_event":
-        return tool_get_audit_event(cleaned_args.get("id") or cleaned_args.get("event_id"))
-    elif tool_name == "hub_list_agents":
-        return collab.list_agents(agent_id, **cleaned_args)
-    elif tool_name == "hub_set_group":
-        return collab.set_group(agent_id, **cleaned_args)
-    elif tool_name == "hub_send_message":
-        return collab.send_message(agent_id, **cleaned_args)
-    elif tool_name == "hub_reply":
-        return collab.reply(agent_id, **cleaned_args)
-    elif tool_name == "hub_inbox":
-        return collab.inbox(agent_id, **cleaned_args)
-    elif tool_name == "hub_read_message":
-        mid = cleaned_args.pop("message_id", None) or cleaned_args.pop("id", None)
-        return collab.read_message(agent_id, mid, **cleaned_args)
-    elif tool_name == "hub_mark_read":
-        return collab.mark_read(agent_id, **cleaned_args)
-    elif tool_name == "hub_create_task":
-        return collab.create_task(agent_id, **cleaned_args)
-    elif tool_name == "hub_list_tasks":
-        return collab.list_tasks(agent_id, **cleaned_args)
-    elif tool_name == "hub_update_task":
-        return collab.update_task(agent_id, **cleaned_args)
-    elif tool_name == "hub_issue_agent_token":
-        return tool_issue_agent_token(caller_agent_id=agent_id, caller_role=role, **cleaned_args)
-    elif tool_name == "hub_revoke_agent_token":
-        return tool_revoke_agent_token(caller_agent_id=agent_id, caller_role=role, **cleaned_args)
-    else:
-        raise ValueError(f"Unknown MCP tool: {tool_name}")
+    fn, mode = entry
+    if mode == "none":
+        return fn()
+    lead: tuple = (agent_id,) if mode == "agent" else ()
+    kwargs = dict(args)
+    if mode == "agent_kw":
+        kwargs["agent_id"] = agent_id
+    elif mode == "admin":
+        kwargs.update(caller_agent_id=agent_id, caller_role=role)
+    try:
+        inspect.signature(fn).bind(*lead, **kwargs)
+    except TypeError as exc:
+        raise ToolArgumentError(f"{tool_name}: {exc}") from None
+    return fn(*lead, **kwargs)
+
+
+def dispatch_tool(agent_id: str, role: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
+    """
+    Run a tool for an authenticated agent. Whatever fails here leaves an audit row: the tools record
+    their own failures (marking the exception sag_audited), everything else (unknown tool, bad
+    arguments, an OSError nobody expected) is recorded once, here.
+    """
+    try:
+        return _dispatch(agent_id, role, tool_name, arguments)
+    except Exception as exc:
+        if not getattr(exc, "sag_audited", False):
+            _audit_failure(agent_id, tool_name, arguments, exc)
+        raise
 
 
 class SSESession:

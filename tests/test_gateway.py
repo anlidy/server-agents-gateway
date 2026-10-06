@@ -1423,6 +1423,194 @@ class TestClipAndTrashIds(_ScratchCwdMixin, unittest.TestCase):
         self.assertTrue(body["stdout"].endswith(TRUNCATED_MARK))
 
 
+class TestDispatchAudit(_ScratchCwdMixin, unittest.TestCase):
+    """docs/v2.md section 3: every tools/call is audited, whether it succeeds or fails, exactly once."""
+
+    def _call(self, tool, args=None, agent="test:agent", role="operator"):
+        from sag.server import dispatch_tool
+
+        return dispatch_tool(agent, role, tool, args)
+
+    def _rows(self):
+        with get_db_connection() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM audit_events ORDER BY rowid;")]
+
+    def _only_row(self):
+        rows = self._rows()
+        self.assertEqual(len(rows), 1, [(r["tool_name"], r["status"]) for r in rows])
+        return rows[0]
+
+    def test_unknown_tool_is_recorded(self):
+        with self.assertRaisesRegex(ValueError, "Unknown MCP tool: hub_nope"):
+            self._call("hub_nope", {"x": 1})
+        row = self._only_row()
+        self.assertEqual((row["tool_name"], row["status"], row["agent_id"]), ("hub_nope", "REJECTED", "test:agent"))
+        self.assertEqual(json.loads(row["params_json"]), {"x": 1})
+
+    def test_tool_names_that_are_not_strings_do_not_break_the_audit(self):
+        for bad in (None, 5, {"a": 1}, "x" * 500):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self._call(bad, {})
+        self.assertEqual(len(self._rows()), 4)
+        self.assertTrue(all(len(r["tool_name"]) <= 100 for r in self._rows()))
+
+    def test_admin_tool_denied_to_an_operator_looks_unknown_but_is_recorded_as_denied(self):
+        with self.assertRaisesRegex(ValueError, "Unknown MCP tool: hub_issue_agent_token"):
+            self._call("hub_issue_agent_token", {"agent_id": "new:agent"})
+        row = self._only_row()
+        self.assertEqual(row["status"], "REJECTED")
+        self.assertIn("admin-only", get_audit_event(row["id"])["stderr"])
+
+    def test_bad_arguments_are_recorded_with_a_readable_message(self):
+        cases = [
+            ("hub_shell", {"command": "echo hi"}, "missing a required argument: 'reason'"),
+            ("hub_shell", {"command": "echo hi", "reason": "r", "bogus": 1}, "unexpected keyword argument 'bogus'"),
+            ("hub_send_message", {"to": "x", "body": "b", "from": "someone:else"}, "'from' is not accepted"),
+            ("hub_read_file", "not an object", "arguments must be an object"),
+        ]
+        for tool, args, expected in cases:
+            with self.subTest(tool=tool, args=args), self.assertRaisesRegex(ValueError, expected):
+                self._call(tool, args)
+        rows = self._rows()
+        self.assertEqual([r["status"] for r in rows], ["REJECTED"] * len(cases))
+        self.assertEqual(rows[0]["reason"], "")
+
+    def test_none_arguments_are_fine_for_tools_without_required_ones(self):
+        self.assertIn("load", json.dumps(self._call("hub_get_status", None)).lower() + "load")
+        self.assertIsInstance(self._call("hub_list_agents", None), dict)
+
+    def test_unexpected_errors_from_file_tools_are_recorded(self):
+        cwd = Path(config.shell_cwd)
+        (cwd / "plain.txt").write_text("x")
+        with self.assertRaises(OSError):  # the parent of the new file is a regular file
+            self._call("hub_write_file", {"path": str(cwd / "plain.txt" / "child"), "content": "c", "reason": "r"})
+        row = self._only_row()
+        self.assertEqual((row["tool_name"], row["status"]), ("hub_write_file", "FAILED"))
+        self.assertTrue(row["target"].endswith("plain.txt/child"))
+        self.assertEqual(row["reason"], "r")
+        self.assertRegex(get_audit_event(row["id"])["stderr"], r"^(NotADirectoryError|FileExistsError): ")
+
+    def test_bad_values_for_read_file_are_recorded(self):
+        path = Path(config.shell_cwd) / "r.txt"
+        path.write_text("x")
+        with self.assertRaises(ValueError):
+            self._call("hub_read_file", {"path": str(path), "offset": "abc"})
+        self.assertEqual(self._only_row()["status"], "FAILED")
+
+    def test_validation_errors_from_collab_tools_are_recorded(self):
+        with self.assertRaises(ValueError):
+            self._call("hub_send_message", {"to": "nobody:here", "body": "hi"})
+        row = self._only_row()
+        self.assertEqual((row["tool_name"], row["status"]), ("hub_send_message", "FAILED"))
+        self.assertEqual(row["target"], "nobody:here")
+
+    def test_failures_the_tools_already_record_are_not_recorded_twice(self):
+        cwd = Path(config.shell_cwd)
+        scenarios = [
+            ("hub_read_file", {"path": str(cwd / "missing.txt")}),
+            ("hub_list_dir", {"path": str(cwd / "missing")}),
+            ("hub_patch_file", {"path": str(cwd / "missing.txt"), "old_string": "a", "new_string": "b", "reason": "r"}),
+            ("hub_shell", {"command": "   ", "reason": "empty"}),
+            ("hub_shell", {"command": "echo hi", "reason": "r", "timeout_seconds": "soon"}),
+            ("hub_mkdir", {"path": str(Path(config.data_dir) / "x"), "reason": "protected"}),
+            ("hub_read_file", {"path": str(cwd)}),
+        ]
+        for tool, args in scenarios:
+            with self.subTest(tool=tool, args=args):
+                with get_db_connection() as conn:
+                    before = conn.execute("SELECT COUNT(*) AS n FROM audit_events;").fetchone()["n"]
+                with self.assertRaises(Exception):
+                    self._call(tool, args)
+                with get_db_connection() as conn:
+                    after = conn.execute("SELECT COUNT(*) AS n FROM audit_events;").fetchone()["n"]
+                self.assertEqual(after - before, 1)
+
+    def test_permission_errors_are_recorded_as_rejected(self):
+        # the admin check inside the tool is the second line of defence behind the dispatcher's
+        with self.assertRaises(PermissionError):
+            from sag.server import _audit_failure
+
+            try:
+                tool_issue_agent_token(caller_agent_id="test:agent", caller_role="operator", agent_id="x:y")
+            except PermissionError as exc:
+                _audit_failure("test:agent", "hub_issue_agent_token", {"agent_id": "x:y"}, exc)
+                raise
+        row = self._only_row()
+        self.assertEqual((row["status"], row["action_type"]), ("REJECTED", "tool_rejected"))
+
+    def test_big_and_secret_arguments_are_summarised_and_redacted(self):
+        token = "sag_laptop_claude_" + "ab12" * 12
+        with self.assertRaises(Exception):
+            self._call("hub_write_file", {"path": "/proc/nope/x", "content": "A" * 100_000 + token, "reason": "r"})
+        row = self._only_row()
+        params = json.loads(row["params_json"])
+        self.assertLess(len(row["params_json"]), 2000)
+        self.assertIn("chars)", params["content"])
+        self.assertNotIn("ab12ab12", row["params_json"])
+
+    def test_a_failing_audit_write_never_hides_the_real_error(self):
+        err = io.StringIO()
+        with unittest.mock.patch("sag.server.append_audit", side_effect=RuntimeError("db locked")), \
+                contextlib.redirect_stderr(err):
+            with self.assertRaisesRegex(ValueError, "Unknown MCP tool"):
+                self._call("hub_nope")
+        self.assertIn("could not record failed call", err.getvalue())
+
+    def test_rebuild_overview_is_attributed_to_the_caller(self):
+        self._call("hub_rebuild_overview", {"reason": "after a deploy"}, agent="laptop:claude")
+        rows = [r for r in self._rows() if r["tool_name"] == "hub_rebuild_overview"]
+        self.assertEqual([(r["agent_id"], r["reason"]) for r in rows], [("laptop:claude", "after a deploy")])
+
+    def test_shell_result_survives_a_failing_audit_write(self):
+        calls = []
+        def flaky(**kw):
+            calls.append(kw["tool_name"])
+            raise RuntimeError("database is locked")
+
+        err = io.StringIO()
+        with unittest.mock.patch("sag.tools.append_audit", flaky), unittest.mock.patch("sag.tools.time.sleep"), \
+                contextlib.redirect_stderr(err):
+            result = tool_shell("test:agent", "echo ran > proof.txt; echo out", "audit is down")
+        self.assertIn("could not record hub_shell", err.getvalue())
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stdout"], "out\n")
+        self.assertIn("could not be written", result["audit_error"])
+        self.assertEqual((Path(config.shell_cwd) / "proof.txt").read_text(), "ran\n")
+        self.assertEqual(calls, ["hub_shell", "hub_shell"])  # tried twice
+
+    def test_shell_audit_is_retried_once_and_then_no_warning(self):
+        state = {"n": 0}
+        real = append_audit
+
+        def once_locked(**kw):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise RuntimeError("database is locked")
+            return real(**kw)
+
+        with unittest.mock.patch("sag.tools.append_audit", once_locked), unittest.mock.patch("sag.tools.time.sleep"):
+            result = tool_shell("test:agent", "echo hi", "flaky audit")
+        self.assertNotIn("audit_error", result)
+        self.assertEqual(self._only_row()["status"], "SUCCESS")
+
+    def test_query_order_is_stable_within_one_second(self):
+        with unittest.mock.patch("sag.db.time.strftime", return_value="2026-01-01T00:00:00+0000"):
+            for i in range(5):
+                append_audit("test:agent", "hub_shell", "shell_exec", f"cmd{i}", "r", "SUCCESS")
+        self.assertEqual([r["target"] for r in query_audit_logs()], [f"cmd{i}" for i in (4, 3, 2, 1, 0)])
+        self.assertEqual([r["target"] for r in query_audit_logs(limit=2, offset=1)], ["cmd3", "cmd2"])
+
+    def test_trash_listing_order_is_stable_within_one_second(self):
+        cwd = Path(config.shell_cwd)
+        for i in range(4):
+            (cwd / f"t{i}").write_text("x")
+            tool_delete_file("test:agent", str(cwd / f"t{i}"), "r")
+        with get_db_connection() as conn:  # the same second for all of them
+            conn.execute("UPDATE trash_items SET deleted_at = '2026-01-01T00:00:00+0000';")
+            conn.commit()
+        self.assertEqual([Path(i["original_path"]).name for i in list_trash()], ["t3", "t2", "t1", "t0"])
+
+
 class TestReadFileCap(_ScratchCwdMixin, unittest.TestCase):
     """hub_read_file streams the file: bounded memory, line windows, continuation hints."""
 

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -37,6 +38,7 @@ def _audit_then_raise(agent_id, tool_name, action_type, target, reason, status, 
         stderr=str(exc),
         **kwargs,
     )
+    exc.sag_audited = True  # the dispatcher must not record this call a second time
     raise exc
 
 
@@ -98,6 +100,7 @@ def tool_shell(
                 params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
                 stderr=str(exc),
             )
+            exc.sag_audited = True
             raise
         except Exception as exc:
             # Anything else (spawn failure, bad arguments, a bug) still leaves a trace: every call is audited.
@@ -111,6 +114,7 @@ def tool_shell(
                 params={"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds},
                 stderr=f"{type(exc).__name__}: {exc}",
             )
+            exc.sag_audited = True
             raise
         finally:
             try:
@@ -126,7 +130,7 @@ def tool_shell(
     duration_ms = int((time.time() - start) * 1000)
     status = "SUCCESS" if code == 0 else "FAILED"
     workdir = cwd or config.shell_cwd
-    append_audit(
+    audit_kwargs = dict(
         agent_id=agent_id,
         tool_name="hub_shell",
         action_type="shell_exec",
@@ -146,7 +150,7 @@ def tool_shell(
         stdout=stdout,
         stderr=stderr,
     )
-    return {
+    result: Dict[str, Any] = {
         "cwd": workdir,
         "exit_code": code,
         "stdout": stdout,
@@ -155,6 +159,19 @@ def tool_shell(
         "duration_ms": duration_ms,
         "trash_ids": trash_ids,
     }
+    # The command has run. If the audit row cannot be written (database locked, disk full) the result must
+    # still reach the caller, or it will think nothing happened and run the command again; say so instead.
+    for attempt in (1, 2):
+        try:
+            append_audit(**audit_kwargs)
+            break
+        except Exception as exc:
+            if attempt == 2:
+                print(f"[audit] could not record hub_shell for {agent_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+                result["audit_error"] = f"the command ran, but its audit row could not be written: {exc}"
+            else:
+                time.sleep(0.2)
+    return result
 
 
 _SKIP_CHUNK = 64 * 1024
@@ -214,15 +231,9 @@ def tool_read_file(
 ) -> Dict[str, Any]:
     target = Path(path).resolve()
     if not target.exists():
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_read_file",
-            action_type="file_read",
-            target=str(target),
-            reason="",
-            status="FAILED",
+        _audit_then_raise(
+            agent_id, "hub_read_file", "file_read", target, "", "FAILED", FileNotFoundError(str(target))
         )
-        raise FileNotFoundError(str(target))
     if target.is_dir():
         exc = IsADirectoryError(str(target))
         _audit_then_raise(agent_id, "hub_read_file", "file_read", target, "", "FAILED", exc)
@@ -287,15 +298,9 @@ def tool_read_file(
 def tool_list_dir(agent_id: str, path: str) -> Dict[str, Any]:
     target = Path(path).resolve()
     if not target.exists():
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_list_dir",
-            action_type="dir_list",
-            target=str(target),
-            reason="",
-            status="FAILED",
+        _audit_then_raise(
+            agent_id, "hub_list_dir", "dir_list", target, "", "FAILED", FileNotFoundError(str(target))
         )
-        raise FileNotFoundError(str(target))
     if not target.is_dir():
         exc = NotADirectoryError(str(target))
         _audit_then_raise(agent_id, "hub_list_dir", "dir_list", target, "", "FAILED", exc)
@@ -387,15 +392,9 @@ def tool_patch_file(
         exc = ValueError("old_string must not be empty")
         _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
     if not target.exists():
-        append_audit(
-            agent_id=agent_id,
-            tool_name="hub_patch_file",
-            action_type="file_patch",
-            target=str(target),
-            reason=reason,
-            status="FAILED",
+        _audit_then_raise(
+            agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", FileNotFoundError(str(target))
         )
-        raise FileNotFoundError(str(target))
     if target.is_dir():
         exc = IsADirectoryError(str(target))
         _audit_then_raise(agent_id, "hub_patch_file", "file_patch", target, reason, "FAILED", exc)
@@ -610,10 +609,10 @@ def tool_get_overview(section: Optional[str] = None) -> str:
     return select_sections(text, section) if section and section.strip() else text
 
 
-def tool_rebuild_overview(reason: str = "refresh status") -> str:
+def tool_rebuild_overview(reason: str = "refresh status", agent_id: str = "system") -> str:
     reconcile()
     append_audit(
-        agent_id="system",
+        agent_id=agent_id,
         tool_name="hub_rebuild_overview",
         action_type="overview_rebuild",
         target="SERVER_AGENTS.md",

@@ -343,7 +343,7 @@ def query_audit_logs(
         params.extend([f"%{keyword}%", f"%{keyword}%"])
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     limit = max(1, min(int(limit), 200))
-    query = f"SELECT * FROM audit_events {where} ORDER BY timestamp DESC LIMIT ? OFFSET ?;"
+    query = f"SELECT * FROM audit_events {where} ORDER BY timestamp DESC, rowid DESC LIMIT ? OFFSET ?;"
     params.extend([limit, offset])
     with get_db_connection() as conn:
         rows = conn.execute(query, params).fetchall()
