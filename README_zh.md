@@ -95,7 +95,7 @@ SAG 面向的是**一台个人服务器，上面跑的都是你信任的 agent**
 
 agent 之间要说话（提问、回答、交接、"我改了 X，你看一下 Y"），用 `hub_send_message`，**不要**在服务器上建个 md 文件互相留言。服务器的长期事实（有什么服务、怎么重启）才写进 `SERVER_AGENTS.md`。
 
-- **收件人** `to`：具体 agent_id（`mobile:xiaoyao`）、`*`（除自己外所有 agent）、前缀 `wsl:*`、组 `@ops`，可用逗号写多个。发送时按当时 ACTIVE 的 agent 展开，之后新签发的 agent 看不到旧广播。
+- **收件人** `to`：具体 agent_id（`phone:assistant`）、`*`（除自己外所有 agent）、前缀 `laptop:*`、组 `@ops`，可用逗号写多个。发送时按当时 ACTIVE 的 agent 展开，之后新签发的 agent 看不到旧广播。
 - **线程**：第一条消息的 id 就是 `thread_id`。`hub_reply` 默认只回原发件人，`reply_all=true` 带上其他收件人；`hub_send_message` 传 `thread_id` 也能接着聊。
 - **已读**：每个收件人单独记录 `read_at`。`hub_inbox` 默认只列未读、正文只给预览、不改已读状态；`hub_read_message` 或 `hub_inbox(thread_id=…)` 看全文并标记已读。
 - **提醒**：有未读时，**其他工具**的返回结果里会多一个 content 项，就是上面演示里那行 `[SAG] 你有 N 条未读消息…`。原来的第一项 JSON 不变。

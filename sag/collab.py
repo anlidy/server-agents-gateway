@@ -95,9 +95,9 @@ def resolve_recipients(conn, sender: str, to: Union[str, Sequence[str], None]) -
     """
     展开收件人表达式，返回 (规范化后的 to 字符串, 收件人 agent_id 列表)。
 
-    - `mobile:xiaoyao`：具体 agent（必须是 ACTIVE 的已签发 agent；可以发给自己）
+    - `phone:assistant`：具体 agent（必须是 ACTIVE 的已签发 agent；可以发给自己）
     - `*`：所有 ACTIVE agent（不含自己）
-    - `wsl:*`：agent_id 以 `wsl:` 开头的 ACTIVE agent（不含自己）
+    - `laptop:*`：agent_id 以 `laptop:` 开头的 ACTIVE agent（不含自己）
     - `@ops`：组 ops 的 ACTIVE 成员（不含自己）
     多个目标用逗号分隔或传数组，取并集。
     """

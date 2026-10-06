@@ -239,7 +239,7 @@ MCP_TOOLS_SPEC = [
             "addressed to another agent: questions, answers, handoffs, 'I changed X, please check Y', "
             "reviews. Keep files/SERVER_AGENTS.md for durable facts about the server. "
             "The sender is always your token's agent_id. "
-            "`to`: an agent_id (see hub_list_agents), `*` for every other agent, `prefix:*` (e.g. `wsl:*`), "
+            "`to`: an agent_id (see hub_list_agents), `*` for every other agent, `prefix:*` (e.g. `laptop:*`), "
             "`@group`, or several joined by commas. Pass thread_id to continue an existing thread. "
             "Recipients see an unread hint appended to their next tool result."
         ),

@@ -588,7 +588,7 @@ class TestGatewayV2(unittest.TestCase):
             self.assertIn(name, text.split())
 
     def test_audit_redaction_in_shell_log(self):
-        tok = "sag_cursor_helm_" + "ab12" * 12
+        tok = "sag_ide_cursor_" + "ab12" * 12
         raw = (
             f"echo Authorization: Bearer {tok} "
             "and github_pat_AAA_BBB"
@@ -606,13 +606,13 @@ class TestGatewayV2(unittest.TestCase):
     def test_redact_sag_tokens_but_not_sag_names(self):
         from sag.audit_redact import redact_secrets
 
-        real = issue_agent_token("wsl:red-team.x", "operator")
+        real = issue_agent_token("laptop:red-team.x", "operator")
         for secret in (real, real[:40], "TOKEN=" + real + ";"):
             self.assertNotIn(real[:40], redact_secrets(secret), msg=secret)
         for plain in (
             "/tmp/sag_patches /tmp/sag_latest.bundle sag_2.1.1.bundle",
             "cat /tmp/sag_rm_round3.txt; ls /opt/sag_data",
-            "python3 -m sag issue-token wsl:claude",
+            "python3 -m sag issue-token laptop:claude",
         ):
             self.assertEqual(redact_secrets(plain), plain)
 
@@ -764,7 +764,7 @@ who changes topology updates inventory
         ensure_document()
         Path(config.overview_path).write_text(
             "# h\n\n<!-- sag-status:start -->\n| up |\n<!-- sag-status:end -->\n"
-            "## Host\nhost-body\n\n## Inventory\n\n### sag\nsag-body\n\n### xmem\nxmem-body\n\n"
+            "## Host\nhost-body\n\n## Inventory\n\n### sag\nsag-body\n\n### app\napp-body\n\n"
             "## Conventions\nconv-body\n",
             encoding="utf-8",
         )
@@ -775,10 +775,10 @@ who changes topology updates inventory
         part = tool_get_overview(section="SAG, conventions")
         self.assertIn("sag-body", part)
         self.assertIn("conv-body", part)
-        self.assertNotIn("xmem-body", part)
+        self.assertNotIn("app-body", part)
         self.assertNotIn("host-body", part)
         inv = tool_get_overview(section="Inventory")
-        self.assertIn("xmem-body", inv)
+        self.assertIn("app-body", inv)
         self.assertNotIn("conv-body", inv)
         with self.assertRaisesRegex(ValueError, "Available"):
             tool_get_overview(section="nope")
@@ -2007,11 +2007,11 @@ class TestCredentials(unittest.TestCase):
         _wipe_db()
 
     def test_agent_id_format_is_validated_at_issuance(self):
-        for bad in ("", " ", "a b", "ops team:bot", "x,y", "@group", "*", "wsl:*", "a/b", "\u514b\u52b3\u5fb7",
+        for bad in ("", " ", "a b", "ops team:bot", "x,y", "@group", "*", "laptop:*", "a/b", "\u514b\u52b3\u5fb7",
                     "a" * 65, ":x", "x:", "a::b", "a:b:c:d:e", None, 5):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 issue_agent_token(bad, "operator")
-        for good in ("cron", "laptop:claude", "mobile:xiaoyao", "wsl:red-team.x", "a:b:c", "A_1.2-3"):
+        for good in ("cron", "laptop:claude", "phone:assistant", "laptop:red-team.x", "a:b:c", "A_1.2-3"):
             with self.subTest(good=good):
                 self.assertEqual(authenticate_bearer_token(issue_agent_token(good, "operator"))[0], good)
 
@@ -2344,7 +2344,7 @@ class TestCollab(unittest.TestCase):
         _wipe_db()
         init_db()
         self.tokens = {}
-        for a in ("mobile:xiaoyao", "wsl:pi", "wsl:claude", "cursor:helm"):
+        for a in ("phone:assistant", "laptop:codex", "laptop:claude", "ide:cursor"):
             self.tokens[a] = issue_agent_token(a, role="operator")
         issue_agent_token("old:gone", role="operator")
         revoke_agent_token("old:gone")
@@ -2373,144 +2373,144 @@ class TestCollab(unittest.TestCase):
             self.assertIn(t, tables)
 
     def test_list_agents_hides_tokens(self):
-        authenticate_bearer_token("Bearer " + self.tokens["wsl:pi"])
-        out = self._call("wsl:claude", "hub_list_agents")
+        authenticate_bearer_token("Bearer " + self.tokens["laptop:codex"])
+        out = self._call("laptop:claude", "hub_list_agents")
         ids = [a["agent_id"] for a in out["agents"]]
-        self.assertIn("wsl:pi", ids)
+        self.assertIn("laptop:codex", ids)
         self.assertNotIn("old:gone", ids)
         blob = json.dumps(out)
         for tok in self.tokens.values():
             self.assertNotIn(tok, blob)
         self.assertNotIn("token_hash", blob)
         me = [a for a in out["agents"] if a["is_you"]]
-        self.assertEqual([a["agent_id"] for a in me], ["wsl:claude"])
-        pi = [a for a in out["agents"] if a["agent_id"] == "wsl:pi"][0]
+        self.assertEqual([a["agent_id"] for a in me], ["laptop:claude"])
+        pi = [a for a in out["agents"] if a["agent_id"] == "laptop:codex"][0]
         self.assertTrue(pi["last_active_at"])
-        with_revoked = self._call("wsl:claude", "hub_list_agents", include_revoked=True)
+        with_revoked = self._call("laptop:claude", "hub_list_agents", include_revoked=True)
         self.assertIn("old:gone", [a["agent_id"] for a in with_revoked["agents"]])
 
     def test_direct_message_inbox_read_flow(self):
-        sent = self._call("wsl:claude", "hub_send_message", to="mobile:xiaoyao", subject="迁移问题", body="x" * 1000)
-        self.assertEqual(sent["recipients"], ["mobile:xiaoyao"])
+        sent = self._call("laptop:claude", "hub_send_message", to="phone:assistant", subject="迁移问题", body="x" * 1000)
+        self.assertEqual(sent["recipients"], ["phone:assistant"])
         self.assertEqual(sent["thread_id"], sent["id"])
-        box = self._call("mobile:xiaoyao", "hub_inbox")
+        box = self._call("phone:assistant", "hub_inbox")
         self.assertEqual(box["unread_total"], 1)
         m = box["messages"][0]
-        self.assertEqual(m["from"], "wsl:claude")
+        self.assertEqual(m["from"], "laptop:claude")
         self.assertFalse(m["read"])
         self.assertTrue(m.get("body_truncated"))
         self.assertLess(len(m["body"]), 1000)
         # inbox 本身不标已读
-        self.assertEqual(self._call("mobile:xiaoyao", "hub_inbox")["unread_total"], 1)
+        self.assertEqual(self._call("phone:assistant", "hub_inbox")["unread_total"], 1)
         # 发件人自己的收件箱是空的
-        self.assertEqual(self._call("wsl:claude", "hub_inbox")["messages"], [])
-        full = self._call("mobile:xiaoyao", "hub_read_message", message_id=sent["id"])
+        self.assertEqual(self._call("laptop:claude", "hub_inbox")["messages"], [])
+        full = self._call("phone:assistant", "hub_read_message", message_id=sent["id"])
         self.assertEqual(len(full["body"]), 1000)
         self.assertTrue(full["read"])
         self.assertTrue(full["recipients"][0]["read_at"])
-        self.assertEqual(self._call("mobile:xiaoyao", "hub_inbox")["unread_total"], 0)
-        again = self._call("mobile:xiaoyao", "hub_inbox", unread_only=False)
+        self.assertEqual(self._call("phone:assistant", "hub_inbox")["unread_total"], 0)
+        again = self._call("phone:assistant", "hub_inbox", unread_only=False)
         self.assertEqual(len(again["messages"]), 1)
         self.assertTrue(again["messages"][0]["read"])
         # 发件人能看到对方已读
-        seen = self._call("wsl:claude", "hub_read_message", message_id=sent["id"])
+        seen = self._call("laptop:claude", "hub_read_message", message_id=sent["id"])
         self.assertTrue(seen["recipients"][0]["read_at"])
         # 旁人看不到
         with self.assertRaises(ValueError):
-            self._call("cursor:helm", "hub_read_message", message_id=sent["id"])
+            self._call("ide:cursor", "hub_read_message", message_id=sent["id"])
 
     def test_broadcast_prefix_and_group_targets(self):
-        b = self._call("wsl:claude", "hub_send_message", to="*", subject="重启 SAG", body="5 分钟后重启")
-        self.assertEqual(sorted(b["recipients"]), ["cursor:helm", "mobile:xiaoyao", "wsl:pi"])
-        p = self._call("mobile:xiaoyao", "hub_send_message", to="wsl:*", body="wsl 的注意")
-        self.assertEqual(sorted(p["recipients"]), ["wsl:claude", "wsl:pi"])
-        g = self._call("mobile:xiaoyao", "hub_set_group", group="ops", members=["wsl:pi", "cursor:helm"])
+        b = self._call("laptop:claude", "hub_send_message", to="*", subject="重启 SAG", body="5 分钟后重启")
+        self.assertEqual(sorted(b["recipients"]), ["ide:cursor", "laptop:codex", "phone:assistant"])
+        p = self._call("phone:assistant", "hub_send_message", to="laptop:*", body="laptop 的注意")
+        self.assertEqual(sorted(p["recipients"]), ["laptop:claude", "laptop:codex"])
+        g = self._call("phone:assistant", "hub_set_group", group="ops", members=["laptop:codex", "ide:cursor"])
         self.assertEqual(g["group"], "@ops")
-        m = self._call("wsl:pi", "hub_send_message", to="@ops", body="组消息")
-        self.assertEqual(m["recipients"], ["cursor:helm"])  # 不含自己
-        multi = self._call("wsl:pi", "hub_send_message", to="mobile:xiaoyao, @ops", body="两类目标")
-        self.assertEqual(sorted(multi["recipients"]), ["cursor:helm", "mobile:xiaoyao"])
-        listing = self._call("wsl:pi", "hub_list_agents")
-        self.assertEqual(sorted(listing["groups"]["ops"]), ["cursor:helm", "wsl:pi"])
+        m = self._call("laptop:codex", "hub_send_message", to="@ops", body="组消息")
+        self.assertEqual(m["recipients"], ["ide:cursor"])  # 不含自己
+        multi = self._call("laptop:codex", "hub_send_message", to="phone:assistant, @ops", body="两类目标")
+        self.assertEqual(sorted(multi["recipients"]), ["ide:cursor", "phone:assistant"])
+        listing = self._call("laptop:codex", "hub_list_agents")
+        self.assertEqual(sorted(listing["groups"]["ops"]), ["ide:cursor", "laptop:codex"])
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_send_message", to="@nope", body="x")
+            self._call("laptop:codex", "hub_send_message", to="@nope", body="x")
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_send_message", to="old:gone", body="revoked")
+            self._call("laptop:codex", "hub_send_message", to="old:gone", body="revoked")
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_send_message", to="nobody:here", body="typo")
+            self._call("laptop:codex", "hub_send_message", to="nobody:here", body="typo")
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_send_message", to="wsl:pi", body="")
+            self._call("laptop:codex", "hub_send_message", to="laptop:codex", body="")
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_set_group", group="bad name!", members=[])
+            self._call("laptop:codex", "hub_set_group", group="bad name!", members=[])
 
     def test_sender_cannot_be_spoofed(self):
         for key in ("from", "from_agent", "sender"):
             with self.assertRaises(ValueError):
-                self._call("wsl:pi", "hub_send_message", to="mobile:xiaoyao", body="hi", **{key: "mobile:xiaoyao"})
-        sent = self._call("wsl:pi", "hub_send_message", to="mobile:xiaoyao", body="hi")
-        got = self._call("mobile:xiaoyao", "hub_read_message", message_id=sent["id"])
-        self.assertEqual(got["from"], "wsl:pi")
+                self._call("laptop:codex", "hub_send_message", to="phone:assistant", body="hi", **{key: "phone:assistant"})
+        sent = self._call("laptop:codex", "hub_send_message", to="phone:assistant", body="hi")
+        got = self._call("phone:assistant", "hub_read_message", message_id=sent["id"])
+        self.assertEqual(got["from"], "laptop:codex")
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_create_task", title="t", created_by="mobile:xiaoyao")
+            self._call("laptop:codex", "hub_create_task", title="t", created_by="phone:assistant")
 
     def test_reply_and_thread_view(self):
-        q = self._call("wsl:claude", "hub_send_message", to="mobile:xiaoyao,wsl:pi", subject="端口", body="4190 还用吗？")
-        r = self._call("mobile:xiaoyao", "hub_reply", message_id=q["id"], body="还在用")
-        self.assertEqual(r["recipients"], ["wsl:claude"])
+        q = self._call("laptop:claude", "hub_send_message", to="phone:assistant,laptop:codex", subject="端口", body="8080 还用吗？")
+        r = self._call("phone:assistant", "hub_reply", message_id=q["id"], body="还在用")
+        self.assertEqual(r["recipients"], ["laptop:claude"])
         self.assertEqual(r["thread_id"], q["thread_id"])
         self.assertEqual(r["subject"], "Re: 端口")
         self.assertEqual(r["reply_to"], q["id"])
         # 回复即已读原消息
-        self.assertEqual(self._call("mobile:xiaoyao", "hub_inbox")["unread_total"], 0)
-        ra = self._call("wsl:pi", "hub_reply", message_id=q["id"], body="我也用", reply_all=True)
-        self.assertEqual(sorted(ra["recipients"]), ["mobile:xiaoyao", "wsl:claude"])
+        self.assertEqual(self._call("phone:assistant", "hub_inbox")["unread_total"], 0)
+        ra = self._call("laptop:codex", "hub_reply", message_id=q["id"], body="我也用", reply_all=True)
+        self.assertEqual(sorted(ra["recipients"]), ["laptop:claude", "phone:assistant"])
         # 在线程里继续发
-        cont = self._call("wsl:claude", "hub_send_message", to="wsl:pi", body="收到", thread_id=q["thread_id"])
+        cont = self._call("laptop:claude", "hub_send_message", to="laptop:codex", body="收到", thread_id=q["thread_id"])
         self.assertEqual(cont["thread_id"], q["thread_id"])
         self.assertEqual(cont["subject"], "Re: 端口")
-        thread = self._call("wsl:claude", "hub_inbox", thread_id=q["thread_id"])
+        thread = self._call("laptop:claude", "hub_inbox", thread_id=q["thread_id"])
         self.assertEqual([m["id"] for m in thread["messages"]], [q["id"], r["id"], ra["id"], cont["id"]])
         self.assertEqual(thread["marked_read"], 2)
         self.assertEqual(thread["unread_total"], 0)
-        # cursor:helm 不在线程里
+        # ide:cursor 不在线程里
         with self.assertRaises(ValueError):
-            self._call("cursor:helm", "hub_inbox", thread_id=q["thread_id"])
+            self._call("ide:cursor", "hub_inbox", thread_id=q["thread_id"])
         with self.assertRaises(ValueError):
-            self._call("cursor:helm", "hub_send_message", to="wsl:pi", body="x", thread_id=q["thread_id"])
+            self._call("ide:cursor", "hub_send_message", to="laptop:codex", body="x", thread_id=q["thread_id"])
 
     def test_reply_to_note_to_self(self):
-        note = self._call("wsl:pi", "hub_send_message", to="wsl:pi", subject="备忘", body="记一下")
-        r = self._call("wsl:pi", "hub_reply", message_id=note["id"], body="补充")
-        self.assertEqual(r["recipients"], ["wsl:pi"])
+        note = self._call("laptop:codex", "hub_send_message", to="laptop:codex", subject="备忘", body="记一下")
+        r = self._call("laptop:codex", "hub_reply", message_id=note["id"], body="补充")
+        self.assertEqual(r["recipients"], ["laptop:codex"])
         self.assertEqual(r["thread_id"], note["thread_id"])
-        thread = self._call("wsl:pi", "hub_inbox", thread_id=note["thread_id"])
+        thread = self._call("laptop:codex", "hub_inbox", thread_id=note["thread_id"])
         self.assertEqual(len(thread["messages"]), 2)
         self.assertEqual(thread["unread_total"], 0)
 
     def test_mark_read(self):
-        a = self._call("wsl:pi", "hub_send_message", to="cursor:helm", body="1")
-        self._call("wsl:pi", "hub_send_message", to="cursor:helm", body="2")
-        self._call("wsl:pi", "hub_send_message", to="cursor:helm", body="3")
-        out = self._call("cursor:helm", "hub_mark_read", message_ids=[a["id"]])
+        a = self._call("laptop:codex", "hub_send_message", to="ide:cursor", body="1")
+        self._call("laptop:codex", "hub_send_message", to="ide:cursor", body="2")
+        self._call("laptop:codex", "hub_send_message", to="ide:cursor", body="3")
+        out = self._call("ide:cursor", "hub_mark_read", message_ids=[a["id"]])
         self.assertEqual(out, {"marked_read": 1, "unread_total": 2})
-        out = self._call("cursor:helm", "hub_mark_read", all=True)
+        out = self._call("ide:cursor", "hub_mark_read", all=True)
         self.assertEqual(out["unread_total"], 0)
         with self.assertRaises(ValueError):
-            self._call("cursor:helm", "hub_mark_read")
+            self._call("ide:cursor", "hub_mark_read")
 
     def test_string_booleans_from_clients(self):
-        self._call("wsl:pi", "hub_send_message", to="cursor:helm", body="1")
-        box = self._call("cursor:helm", "hub_inbox", unread_only="false", limit="5")
+        self._call("laptop:codex", "hub_send_message", to="ide:cursor", body="1")
+        box = self._call("ide:cursor", "hub_inbox", unread_only="false", limit="5")
         self.assertFalse(box["unread_only"])
-        self._call("cursor:helm", "hub_mark_read", all="true")
-        self.assertEqual(self._call("cursor:helm", "hub_inbox", unread_only="true")["messages"], [])
-        quiet = self._call("wsl:pi", "hub_create_task", title="t", notify="false")
+        self._call("ide:cursor", "hub_mark_read", all="true")
+        self.assertEqual(self._call("ide:cursor", "hub_inbox", unread_only="true")["messages"], [])
+        quiet = self._call("laptop:codex", "hub_create_task", title="t", notify="false")
         self.assertEqual(quiet["notified"], [])
 
     def test_message_audit_is_redacted(self):
-        secret = "sag_mobile_xiaoyao_deadbeefcafe1234"
+        secret = "sag_phone_assistant_deadbeefcafe1234"
         self._call(
-            "wsl:pi", "hub_send_message", to="mobile:xiaoyao",
+            "laptop:codex", "hub_send_message", to="phone:assistant",
             subject=f"token {secret}", body=f"Authorization: Bearer {secret} github_pat_AAA_BBB",
         )
         rows = query_audit_logs(tool_name="hub_send_message", limit=1)
@@ -2520,23 +2520,23 @@ class TestCollab(unittest.TestCase):
         self.assertNotIn(secret, blob)
         self.assertNotIn("github_pat_AAA_BBB", blob)
         self.assertIn("***", blob)
-        self.assertEqual(rows[0]["agent_id"], "wsl:pi")
+        self.assertEqual(rows[0]["agent_id"], "laptop:codex")
 
     def test_unread_hint_in_tool_results(self):
         from sag import collab
 
         cwd = str(config.shell_cwd)
-        resp = self._rpc("mobile:xiaoyao", "hub_list_dir", path=cwd)
+        resp = self._rpc("phone:assistant", "hub_list_dir", path=cwd)
         self.assertEqual(len(resp["result"]["content"]), 1)
-        self._call("wsl:pi", "hub_send_message", to="mobile:xiaoyao", subject="看一下 caddy", body="...")
-        resp = self._rpc("mobile:xiaoyao", "hub_list_dir", path=cwd)
+        self._call("laptop:codex", "hub_send_message", to="phone:assistant", subject="看一下 caddy", body="...")
+        resp = self._rpc("phone:assistant", "hub_list_dir", path=cwd)
         content = resp["result"]["content"]
         self.assertEqual(len(content), 2)
         # 第一项仍是原来的 JSON，结构不变
         self.assertEqual(json.loads(content[0]["text"])["path"], str(Path(cwd).resolve()))
         self.assertTrue(content[1]["text"].startswith("\n[SAG] "))
         self.assertIn("1 条未读", content[1]["text"])
-        self.assertIn("wsl:pi", content[1]["text"])
+        self.assertIn("laptop:codex", content[1]["text"])
         self.assertIn("hub_inbox", content[1]["text"])
         self.assertLess(len(content[1]["text"]), 120)
         # 看收件箱的工具不重复提示
@@ -2544,83 +2544,83 @@ class TestCollab(unittest.TestCase):
             args = {"all": True} if tool == "hub_mark_read" else {}
             if tool == "hub_read_message":
                 continue
-            resp = self._rpc("mobile:xiaoyao", tool, **args)
+            resp = self._rpc("phone:assistant", tool, **args)
             self.assertEqual(len(resp["result"]["content"]), 1, msg=tool)
-        resp = self._rpc("mobile:xiaoyao", "hub_list_dir", path=cwd)
+        resp = self._rpc("phone:assistant", "hub_list_dir", path=cwd)
         self.assertEqual(len(resp["result"]["content"]), 1)
         # 出错时仍是 error，不附提示
-        self._call("wsl:pi", "hub_send_message", to="mobile:xiaoyao", body="again")
-        err = self._rpc("mobile:xiaoyao", "hub_list_dir", path=cwd + "/missing")
+        self._call("laptop:codex", "hub_send_message", to="phone:assistant", body="again")
+        err = self._rpc("phone:assistant", "hub_list_dir", path=cwd + "/missing")
         self.assertIn("error", err)
 
     def test_task_lifecycle(self):
-        t = self._call("mobile:xiaoyao", "hub_create_task", title="给 xiaoyao-memory 加备份", description="每天 3 点")
+        t = self._call("phone:assistant", "hub_create_task", title="给 notes-db 加备份", description="每天 3 点")
         task = t["task"]
         self.assertEqual(task["status"], "open")
-        self.assertEqual(task["created_by"], "mobile:xiaoyao")
-        self.assertEqual(sorted(t["notified"]), ["cursor:helm", "wsl:claude", "wsl:pi"])
-        box = self._call("wsl:pi", "hub_inbox")
+        self.assertEqual(task["created_by"], "phone:assistant")
+        self.assertEqual(sorted(t["notified"]), ["ide:cursor", "laptop:claude", "laptop:codex"])
+        box = self._call("laptop:codex", "hub_inbox")
         self.assertEqual(box["messages"][0]["task_id"], task["id"])
-        claimed = self._call("wsl:pi", "hub_update_task", task_id=task["id"], action="claim")
+        claimed = self._call("laptop:codex", "hub_update_task", task_id=task["id"], action="claim")
         self.assertEqual(claimed["task"]["status"], "claimed")
-        self.assertEqual(claimed["task"]["assignee"], "wsl:pi")
-        self.assertEqual(claimed["notified"], ["mobile:xiaoyao"])
+        self.assertEqual(claimed["task"]["assignee"], "laptop:codex")
+        self.assertEqual(claimed["notified"], ["phone:assistant"])
         with self.assertRaises(ValueError):
-            self._call("cursor:helm", "hub_update_task", task_id=task["id"], action="claim")
+            self._call("ide:cursor", "hub_update_task", task_id=task["id"], action="claim")
         with self.assertRaises(ValueError):
-            self._call("cursor:helm", "hub_update_task", task_id=task["id"], action="done")
-        mine = self._call("wsl:pi", "hub_list_tasks", assignee="me")
+            self._call("ide:cursor", "hub_update_task", task_id=task["id"], action="done")
+        mine = self._call("laptop:codex", "hub_list_tasks", assignee="me")
         self.assertEqual([x["id"] for x in mine["tasks"]], [task["id"]])
-        done = self._call("wsl:pi", "hub_update_task", task_id=task["id"], action="done", result="cron 已加，见 /etc/cron.d/xm-backup")
+        done = self._call("laptop:codex", "hub_update_task", task_id=task["id"], action="done", result="cron 已加，见 /etc/cron.d/xm-backup")
         self.assertEqual(done["task"]["status"], "done")
         self.assertIn("cron.d", done["task"]["result"])
         self.assertTrue(done["task"]["closed_at"])
         # 创建者在同一线程里收到完成通知
-        box = self._call("mobile:xiaoyao", "hub_inbox")
+        box = self._call("phone:assistant", "hub_inbox")
         self.assertTrue(any("已完成" in m["subject"] and m["thread_id"] == task["thread_id"] for m in box["messages"]))
-        self.assertEqual(self._call("mobile:xiaoyao", "hub_list_tasks")["tasks"], [])
-        self.assertEqual(len(self._call("mobile:xiaoyao", "hub_list_tasks", status="done")["tasks"]), 1)
+        self.assertEqual(self._call("phone:assistant", "hub_list_tasks")["tasks"], [])
+        self.assertEqual(len(self._call("phone:assistant", "hub_list_tasks", status="done")["tasks"]), 1)
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_update_task", task_id=task["id"], action="done")
-        reopened = self._call("mobile:xiaoyao", "hub_update_task", task_id=task["id"], action="reopen")
+            self._call("laptop:codex", "hub_update_task", task_id=task["id"], action="done")
+        reopened = self._call("phone:assistant", "hub_update_task", task_id=task["id"], action="reopen")
         self.assertEqual(reopened["task"]["status"], "open")
-        c = self._call("wsl:pi", "hub_update_task", task_id=task["id"], action="comment", note="再看看")
+        c = self._call("laptop:codex", "hub_update_task", task_id=task["id"], action="comment", note="再看看")
         self.assertEqual(c["task"]["status"], "open")
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_update_task", task_id=task["id"], action="comment")
+            self._call("laptop:codex", "hub_update_task", task_id=task["id"], action="comment")
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_update_task", task_id=task["id"], action="explode")
+            self._call("laptop:codex", "hub_update_task", task_id=task["id"], action="explode")
         rows = query_audit_logs(tool_name="hub_update_task", limit=10)
         self.assertTrue({"task_claim", "task_done", "task_reopen", "task_comment"} <= {r["action_type"] for r in rows})
 
     def test_assigned_task_and_cancel(self):
-        t = self._call("wsl:claude", "hub_create_task", title="看 SAG 日志", assignee="cursor:helm")
+        t = self._call("laptop:claude", "hub_create_task", title="看 SAG 日志", assignee="ide:cursor")
         tid = t["task"]["id"]
-        self.assertEqual(t["notified"], ["cursor:helm"])
+        self.assertEqual(t["notified"], ["ide:cursor"])
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_update_task", task_id=tid, action="claim")
+            self._call("laptop:codex", "hub_update_task", task_id=tid, action="claim")
         with self.assertRaises(ValueError):
-            self._call("wsl:pi", "hub_update_task", task_id=tid, action="cancel")
-        ok = self._call("cursor:helm", "hub_update_task", task_id=tid, action="claim")
+            self._call("laptop:codex", "hub_update_task", task_id=tid, action="cancel")
+        ok = self._call("ide:cursor", "hub_update_task", task_id=tid, action="claim")
         self.assertEqual(ok["task"]["status"], "claimed")
-        rel = self._call("cursor:helm", "hub_update_task", task_id=tid, action="release")
+        rel = self._call("ide:cursor", "hub_update_task", task_id=tid, action="release")
         self.assertEqual(rel["task"]["status"], "open")
         self.assertIsNone(rel["task"]["assignee"])
-        cancelled = self._call("wsl:claude", "hub_update_task", task_id=tid, action="cancel", note="不需要了")
+        cancelled = self._call("laptop:claude", "hub_update_task", task_id=tid, action="cancel", note="不需要了")
         self.assertEqual(cancelled["task"]["status"], "cancelled")
         self.assertEqual(cancelled["task"]["result"], "不需要了")
         with self.assertRaises(ValueError):
-            self._call("wsl:claude", "hub_create_task", title="x", assignee="old:gone")
+            self._call("laptop:claude", "hub_create_task", title="x", assignee="old:gone")
         with self.assertRaises(ValueError):
-            self._call("wsl:claude", "hub_create_task", title="  ")
-        quiet = self._call("wsl:claude", "hub_create_task", title="自己记一笔", notify=False)
+            self._call("laptop:claude", "hub_create_task", title="  ")
+        quiet = self._call("laptop:claude", "hub_create_task", title="自己记一笔", notify=False)
         self.assertEqual(quiet["notified"], [])
         self.assertIsNone(quiet["task"]["thread_id"])
 
     def test_collab_tools_visible_to_operators(self):
         from sag.server import get_tools_for_agent
 
-        names = {t["name"] for t in get_tools_for_agent("wsl:pi", "operator")}
+        names = {t["name"] for t in get_tools_for_agent("laptop:codex", "operator")}
         for n in (
             "hub_list_agents", "hub_send_message", "hub_inbox", "hub_read_message", "hub_mark_read",
             "hub_reply", "hub_set_group", "hub_create_task", "hub_list_tasks", "hub_update_task",
@@ -2653,7 +2653,7 @@ class TestStreamableSession(unittest.TestCase):
         if session:
             headers["mcp-session-id"] = session
         w = _FakeWriter()
-        asyncio.run(handle_streamable_post("wsl:pi", "operator", headers, json.dumps(body).encode(), w))
+        asyncio.run(handle_streamable_post("laptop:codex", "operator", headers, json.dumps(body).encode(), w))
         head, _, payload = w.buf.partition(b"\r\n\r\n")
         return head.decode(), payload
 

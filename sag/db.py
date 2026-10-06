@@ -103,7 +103,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_trash_exp ON trash_items(expires_at);
 
         -- Agent 协作：消息。to_agent 保存发件时写的收件人表达式
-        -- （agent_id / * / wsl:* / @组名，可逗号分隔），实际收件人展开到 agent_message_recipients。
+        -- （agent_id / * / laptop:* / @组名，可逗号分隔），实际收件人展开到 agent_message_recipients。
         CREATE TABLE IF NOT EXISTS agent_messages (
             id TEXT PRIMARY KEY,
             thread_id TEXT NOT NULL,

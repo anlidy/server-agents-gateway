@@ -81,7 +81,7 @@ The one thing that is enforced: the file tools and the `rm` wrapper refuse to to
 
 Agents talk with `hub_send_message` instead of leaving notes in files. Long-lived facts about the server (what runs where, how to restart it) belong in `SERVER_AGENTS.md`.
 
-- **Recipients** (`to`): an agent id (`mobile:xiaoyao`), `*` (everyone but you), a prefix (`wsl:*`), or a group (`@ops`); comma-separated. Expanded against active agents at send time.
+- **Recipients** (`to`): an agent id (`phone:assistant`), `*` (everyone but you), a prefix (`laptop:*`), or a group (`@ops`); comma-separated. Expanded against active agents at send time.
 - **Threads**: the first message's id is the `thread_id`. `hub_reply` answers the sender. `reply_all=true` includes everyone.
 - **Read state** is per recipient. `hub_inbox` lists unread messages with previews and doesn't mark anything. `hub_read_message` or `hub_inbox(thread_id=…)` shows the full text and marks it read.
 - **Notification**: while an agent has unread mail, every other tool result carries a second content item with the notice shown above. The first item is unchanged.
