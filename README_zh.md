@@ -115,7 +115,7 @@ agent 之间要说话（提问、回答、交接、"我改了 X，你看一下 Y
 | `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | 文本文件。覆盖、局部替换、删除都先把旧版本放进回收站。读文件一次最多返回 2MiB 的整行，超出从 `next_offset` 接着读；管道和设备文件不读。 |
 | `hub_list_dir` / `hub_mkdir` | 列目录；mkdir -p。 |
 | `hub_list_trash` / `hub_restore_file` | 按 id 还原，30 天过期。`overwrite=true` 会覆盖现在的内容（现有内容先进回收站），所以覆盖也能撤销。 |
-| `hub_get_overview` / `hub_rebuild_overview` | 读 `SERVER_AGENTS.md`；rebuild 只刷新状态区。 |
+| `hub_get_overview` / `hub_rebuild_overview` | 读 `SERVER_AGENTS.md`：默认返回状态区、整节的 `## Host` / `## Conventions` 和 Inventory 索引（每个 `###` 加它的字段行）；`section=短名` 读某一节，`section=all` 读全文。rebuild 只刷新状态区。 |
 | `hub_get_status` | 负载、内存、磁盘、失败单元、服务探活。 |
 | `hub_query_audit_logs` / `hub_get_audit_event` | 事件列表 vs 完整的 stdout/stderr/diff。 |
 | `hub_list_agents` | 已签发的 agent、最近活跃时间、分组（不含 token）。 |
@@ -165,7 +165,7 @@ claude mcp add --transport http sag http://127.0.0.1:4180/mcp --header "Authoriz
 
 1. 克隆到 `/opt/server-agents-gateway`，装上 [systemd 单元](deploy/server-agents-gateway.service)。它以 root 运行，是有意的。
 2. 只通过 Cloudflare Tunnel 暴露，前面加 Access，见 [deploy/DOMAIN_INGRESS.md](deploy/DOMAIN_INGRESS.md)。不要在防火墙放行 4180。
-3. 第一次启动会写 `SERVER_AGENTS.md` 骨架。人写 `## Host`。上新服务就在 `## Inventory` 下加一个 `###` 小节，写 `- probe:` 行（`systemd <unit>`、`docker <容器>`、`http <url>`、`tcp <host:port>`），网关会刷新 `sag-status` 标记之间的状态表。谁改拓扑谁改那一节。
+3. 第一次启动会写 `SERVER_AGENTS.md` 骨架。人写 `## Host`。上新服务就在 `## Inventory` 下加一个 `###` 小节，写 `- probe:` 行（`systemd <unit>`、`docker <容器>`、`http <url>`、`tcp <host:port>`），可选 `- path:` / `- url:` / `- listen:` / `- depends:` / `- doc:`，说明写在下面，网关会刷新 `sag-status` 标记之间的状态表。谁改拓扑谁改那一节。
 
 ### 命令行
 

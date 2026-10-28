@@ -154,11 +154,13 @@ MCP_TOOLS_SPEC = [
     {
         "name": "hub_get_overview",
         "description": (
-            "Read SERVER_AGENTS.md from disk (no cache). Start work by reading this. "
+            "Read SERVER_AGENTS.md from disk (no cache). Read it once at the start of every session. "
+            "By default returns the status fence, every ## section (Host, Conventions, ...) in full, "
+            "and an Inventory index: each ### heading with its field lines, bodies left out. "
+            "Before touching a service, read its section with `section`. "
             "Top sag-status fence is generated (do not edit). "
             "Inventory ### sections: add `- probe: systemd|docker|http|tcp ...` to show up/down. "
-            "Full format is in ## Conventions in the same file. "
-            "Read the whole file once per session; after that use `section` to re-read parts."
+            "Full format is in ## Conventions in the same file."
         ),
         "inputSchema": {
             "type": "object",
@@ -166,7 +168,8 @@ MCP_TOOLS_SPEC = [
                 "section": {
                     "type": "string",
                     "description": (
-                        "Optional. `toc` = status table + heading list. Otherwise comma-separated "
+                        "Optional. Omit for the default digest (Inventory as an index). `all` = whole file. "
+                        "`toc` = status table + heading list. Otherwise comma-separated "
                         "## / ### titles (e.g. `sag,Conventions`), each returned with its body."
                     ),
                 },

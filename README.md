@@ -101,7 +101,7 @@ Agents talk with `hub_send_message` instead of leaving notes in files. Long-live
 | `hub_read_file` / `hub_write_file` / `hub_patch_file` / `hub_delete_file` | Text files. Overwrite, patch and delete move the old version to the trash. A read returns at most 2 MiB of whole lines; continue from `next_offset`. Pipes and devices are refused. |
 | `hub_list_dir` / `hub_mkdir` | List a directory; `mkdir -p`. |
 | `hub_list_trash` / `hub_restore_file` | Restore by id. 30-day expiry. `overwrite=true` puts the item back over what is there now (which goes into the trash first), so an overwrite can be undone. |
-| `hub_get_overview` / `hub_rebuild_overview` | Read `SERVER_AGENTS.md`; rebuild only refreshes the status section. |
+| `hub_get_overview` / `hub_rebuild_overview` | Read `SERVER_AGENTS.md`: by default the status section, `## Host` / `## Conventions` in full and an Inventory index (each `###` with its field lines); `section=<name>` reads one section, `section=all` the whole file. Rebuild only refreshes the status section. |
 | `hub_get_status` | Load, memory, disks, failed units, service probes. |
 | `hub_query_audit_logs` / `hub_get_audit_event` | Event list vs. full stdout/stderr/diff. |
 | `hub_list_agents` | Issued agents, last activity, groups (no tokens). |
@@ -151,7 +151,7 @@ The legacy SSE transport is still served at `/sse`. Run the tests with `python3 
 
 1. Clone to `/opt/server-agents-gateway` and install [the systemd unit](deploy/server-agents-gateway.service). It runs as root, on purpose.
 2. Expose it only through a Cloudflare Tunnel with Access in front, as described in [deploy/DOMAIN_INGRESS.md](deploy/DOMAIN_INGRESS.md). Never open port 4180 in the firewall.
-3. On first start the gateway writes a `SERVER_AGENTS.md` skeleton. Fill in `## Host`. Add a `###` section under `## Inventory` for each service with `- probe:` lines (`systemd <unit>`, `docker <container>`, `http <url>`, `tcp <host:port>`). The gateway keeps the status table between the `sag-status` markers up to date. Whoever changes the topology updates the inventory.
+3. On first start the gateway writes a `SERVER_AGENTS.md` skeleton. Fill in `## Host`. Add a `###` section under `## Inventory` for each service with `- probe:` lines (`systemd <unit>`, `docker <container>`, `http <url>`, `tcp <host:port>`) and optional `- path:` / `- url:` / `- listen:` / `- depends:` / `- doc:` lines; the notes go below them. The gateway keeps the status table between the `sag-status` markers up to date. Whoever changes the topology updates the inventory.
 
 ### CLI
 
