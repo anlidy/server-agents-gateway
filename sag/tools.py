@@ -22,7 +22,7 @@ from .auth import issue_agent_token, revoke_agent_token
 from .config import config
 from .db import append_audit, get_audit_event, get_db_connection, query_audit_logs
 from .executor import CommandExecutionError, execute_shell
-from .overview import overview_path, read_overview, select_sections, write_handwritten
+from .overview import overview_digest, overview_path, read_overview, select_sections, write_handwritten
 from .reconciler import collect_host_status, reconcile, request_reconcile
 from .trash import ProtectedPathError, is_protected, lexical_path, list_trash, restore_trash, trash_put
 
@@ -606,7 +606,7 @@ def tool_get_overview(section: Optional[str] = None) -> str:
 
     ensure_document()
     text = read_overview()
-    return select_sections(text, section) if section and section.strip() else text
+    return select_sections(text, section) if section and section.strip() else overview_digest(text)
 
 
 def tool_rebuild_overview(reason: str = "refresh status", agent_id: str = "system") -> str:

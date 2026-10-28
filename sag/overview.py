@@ -26,7 +26,7 @@ CONVENTIONS_TEMPLATE = """\
 - 不要改文首 `sag-status` 围栏。
 - Inventory 一节一个 `### 短名`。要探活就写一行：
   `- probe: systemd <unit>` / `docker <container>` / `http <url>` / `tcp <host:port>`
-- 可选：`- path:` `- url:` `- listen:` `- depends:`。说明写在列表下面。不要写当前 up/down。
+- 可选：`- path:` `- url:` `- listen:` `- depends:` `- doc:`（操作手册的位置）。说明写在列表下面。不要写当前 up/down。
 - 拓扑变化同一轮改对应 `###`。
 """
 
@@ -97,12 +97,60 @@ def _headings(text: str) -> List[Tuple[int, int, str]]:
     return out
 
 
+_FIELD_LINE = re.compile(r"^- (probe|path|url|listen|depends|doc):")
+
+DIGEST_FOOTER = (
+    "Inventory bodies omitted. Before touching a service, read it with section=<short name> "
+    "(comma-separated for several); section=all returns the whole file.\n"
+)
+
+
+def overview_digest(text: str) -> str:
+    """
+    Default hub_get_overview reply: everything before the first ## (title + status fence) and every
+    ## section verbatim, except ## Inventory, which is cut down to each ### heading, its field lines
+    and the size of the body left out.
+    """
+    lines = text.splitlines(True)
+    heads = _headings(text)
+    tops = [(idx, title) for idx, lvl, title in heads if lvl == 2]
+    if not tops:
+        return text.rstrip() + "\n\n" + DIGEST_FOOTER
+    out = ["".join(lines[: tops[0][0]])]
+    for n, (idx, title) in enumerate(tops):
+        end = tops[n + 1][0] if n + 1 < len(tops) else len(lines)
+        if title.lower() != "inventory":
+            out.append("".join(lines[idx:end]))
+            continue
+        out.append(lines[idx].rstrip() + "\n\n")
+        subs = [j for j, lvl, _ in heads if lvl == 3 and idx < j < end]
+        if not subs:
+            out.append("(no ### sections yet)\n\n")
+        for m, j in enumerate(subs):
+            stop = subs[m + 1] if m + 1 < len(subs) else end
+            fields, body, fenced = [], [], False
+            for line in lines[j + 1 : stop]:
+                if line.startswith("```"):
+                    fenced = not fenced
+                if not fenced and _FIELD_LINE.match(line):
+                    fields.append(line.rstrip() + "\n")
+                else:
+                    body.append(line)
+            size = len("".join(body).strip())
+            note = f"(body ~{size} chars)" if size else "(no body)"
+            out.append(f"{lines[j].rstrip()}  {note}\n" + "".join(fields) + "\n")
+    return "".join(out).rstrip() + "\n\n" + DIGEST_FOOTER
+
+
 def select_sections(text: str, section: str) -> str:
     """
+    section="all": the whole file.
     section="toc": status fence + heading list.
     Otherwise comma-separated heading titles (case-insensitive, without #),
     each returned with its body up to the next heading of the same or higher level.
     """
+    if section.strip().lower() == "all":
+        return text
     heads = _headings(text)
     if section.strip().lower() == "toc":
         fence = ""

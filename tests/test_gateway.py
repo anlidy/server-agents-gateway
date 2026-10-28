@@ -47,6 +47,7 @@ from sag.db import (
 from sag.clip import TRUNCATED_MARK, clip_output
 from sag.executor import CommandExecutionError, _Capture, execute_shell
 from sag.overview import (
+    CONVENTIONS_TEMPLATE,
     STATUS_END,
     STATUS_START,
     ensure_document,
@@ -782,6 +783,60 @@ who changes topology updates inventory
         self.assertNotIn("conv-body", inv)
         with self.assertRaisesRegex(ValueError, "Available"):
             tool_get_overview(section="nope")
+
+    def test_get_overview_default_digest(self):
+        ensure_document()
+        doc = (
+            "# h\n\n<!-- sag-status:start -->\n| up |\n<!-- sag-status:end -->\n\n"
+            "## Host\nhost-body\n\n### disks\ndisk-body\n\n"
+            "## Inventory\n\nintro-text\n\n"
+            "### web\n\n- probe: systemd web.service\n- path: /opt/web\n- doc: /opt/web/RUNBOOK.md\n\n"
+            "web-body line one\nweb-body line two\n\n"
+            "### worker\n\nworker-body before fields\n\n- url: http://127.0.0.1:8080/health\n"
+            "- depends: web\n\n```\n- path: /in/code/block\n```\n\n"
+            "### cache\n- listen: 127.0.0.1:6379\n\n"
+            "## Conventions\nconv-body\n"
+        )
+        Path(config.overview_path).write_text(doc, encoding="utf-8")
+        text = tool_get_overview()
+        self.assertTrue(text.startswith("# h\n\n<!-- sag-status:start -->\n| up |\n<!-- sag-status:end -->\n"))
+        self.assertIn("## Host\nhost-body\n\n### disks\ndisk-body\n", text)
+        self.assertIn("## Conventions\nconv-body\n", text)
+        self.assertIn(
+            "### web  (body ~{} chars)\n- probe: systemd web.service\n- path: /opt/web\n"
+            "- doc: /opt/web/RUNBOOK.md\n".format(len("web-body line one\nweb-body line two")),
+            text,
+        )
+        # field lines further down the section are still found, in order; fenced ones are body
+        self.assertIn("- url: http://127.0.0.1:8080/health\n- depends: web\n", text)
+        self.assertNotIn("/in/code/block", text)
+        self.assertIn("### cache  (no body)\n- listen: 127.0.0.1:6379\n", text)
+        for body in ("web-body", "worker-body", "intro-text"):
+            self.assertNotIn(body, text)
+        self.assertLess(text.index("### cache"), text.index("## Conventions"))
+        self.assertTrue(text.rstrip().endswith("section=all returns the whole file."))
+        self.assertIn("section=<short name>", text)
+        self.assertEqual(tool_get_overview(section="all"), doc)
+        self.assertEqual(tool_get_overview(section=" ALL "), doc)
+        self.assertIn("web-body line two", tool_get_overview(section="web"))
+        toc = tool_get_overview(section="toc")
+        self.assertIn("  ### worker", toc)
+        self.assertNotIn("worker-body", toc)
+
+    def test_get_overview_digest_empty_inventory(self):
+        ensure_document()
+        Path(config.overview_path).write_text(
+            "# h\n\n<!-- sag-status:start -->\n| up |\n<!-- sag-status:end -->\n\n"
+            "## Host\nhost-body\n\n## Inventory\n\n\n## Conventions\nconv-body\n",
+            encoding="utf-8",
+        )
+        text = tool_get_overview()
+        self.assertIn("## Inventory\n\n(no ### sections yet)\n\n## Conventions\nconv-body\n", text)
+        self.assertIn("host-body", text)
+        self.assertIn("section=all", text)
+
+    def test_skeleton_conventions_mention_doc_field(self):
+        self.assertIn("`- doc:`", CONVENTIONS_TEMPLATE)
 
     def test_shell_result_does_not_echo_command(self):
         res = tool_shell("test:agent", "echo hi", "t")
